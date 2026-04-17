@@ -174,6 +174,20 @@ def status(
         model_label += " (via OpenRouter)"
     _print_check(model_label, True)
 
+    # Advanced features
+    _print_check(
+        f"Semantic Chunking: {'ON' if settings.chunking.semantic else 'OFF'}",
+        True,
+    )
+    _print_check(
+        f"Contextual Retrieval: {'ON' if settings.chunking.contextual_retrieval else 'OFF'}",
+        True,
+    )
+    _print_check(
+        f"Self-RAG: {'ON' if settings.retrieval.self_rag else 'OFF'}",
+        True,
+    )
+
     # Docs
     pdfs = list(settings.docs_path.glob("*.pdf"))
     _print_check(f"Documentos PDF ({len(pdfs)} encontrados)", len(pdfs) > 0)
@@ -245,10 +259,25 @@ def ingest(
 
     \b
     Que hace:
-      1. Parsea cada PDF preservando tablas y estructura
-      2. Divide el texto en chunks con contexto del documento
+      1. Parsea cada PDF preservando tablas y estructura (pymupdf4llm)
+      2. Divide el texto en chunks inteligentes
       3. Genera embeddings y los almacena en ChromaDB
       4. Construye un indice BM25 para busqueda lexica
+
+    \b
+    Tecnicas avanzadas (activar en config.yaml):
+      Semantic Chunking         Divide por similitud semantica, no por tamano fijo
+                                chunking.semantic: true
+      Contextual Retrieval      Un LLM genera contexto situacional por cada chunk
+                                chunking.contextual_retrieval: true
+                                (Tecnica Anthropic 2024, reduce errores de retrieval ~49%)
+
+    \b
+    Ejemplos:
+      rag ingest                Indexar nuevos PDFs
+      rag ingest --force        Re-indexar todo desde cero
+      rag config set chunking.semantic true     Activar semantic chunking
+      rag config set chunking.contextual_retrieval true  Activar contextual retrieval
     """
     settings = get_settings(project_root)
     if docs_dir:
@@ -290,6 +319,11 @@ def query(
     """Hacer una consulta rapida contra los documentos indexados.
 
     \b
+    El pipeline busca con retrieval hibrido (dense + BM25), aplica reranking,
+    y genera una respuesta con citas. Si Self-RAG esta activo, verifica
+    la respuesta antes de mostrarla (grading + hallucination check).
+
+    \b
     Ejemplos:
       rag query "What is GRACE?"
       rag query "Que contiene el atlas del agua?" -v
@@ -329,14 +363,23 @@ def chat(
     Escribe tu pregunta en lenguaje natural. El sistema busca en todos
     los documentos indexados y genera una respuesta con citas.
 
+    \b
+    Si Self-RAG esta activado (retrieval.self_rag: true), cada respuesta
+    pasa por verificacion automatica:
+      1. Grading    - filtra documentos irrelevantes
+      2. Reformula  - si no hay suficiente contexto, reformula y reintenta
+      3. Genera     - produce la respuesta con citas
+      4. Verifica   - detecta alucinaciones y regenera si es necesario
+
+    \b
     Comandos disponibles dentro del chat:
-      /sources    Ver fuentes de la ultima respuesta
-      /history    Ver historial de la conversacion
-      /export     Exportar sesion a archivo Markdown
-      /clear      Limpiar historial
-      /verbose    Alternar modo detallado
-      /help       Ver todos los comandos
-      /quit       Salir
+      /sources     Ver fuentes de la ultima respuesta
+      /reflection  Ver log de verificacion Self-RAG
+      /history     Ver historial de la conversacion
+      /export      Exportar sesion a archivo Markdown
+      /verbose     Alternar modo detallado (fuentes + Self-RAG)
+      /help        Ver todos los comandos
+      /quit        Salir
     """
     settings = get_settings(project_root)
     if not _require_ready(settings):
@@ -358,8 +401,25 @@ def chat(
     # Quick-start guide
     console.print("[bold]Como funciona:[/bold]")
     console.print("  1. Escribe tu pregunta en lenguaje natural (espanol o ingles)")
-    console.print("  2. El sistema busca en los documentos y genera una respuesta")
-    console.print("  3. Cada respuesta incluye citas [Source: archivo, Page: N]\n")
+    console.print("  2. El sistema busca en los documentos usando retrieval hibrido (dense + BM25)")
+    console.print("  3. Reranking selecciona los fragmentos mas relevantes")
+    console.print("  4. El LLM genera una respuesta con citas [Source: archivo, Page: N]")
+    if settings.retrieval.self_rag:
+        console.print("  5. [cyan]Self-RAG[/cyan] verifica la respuesta: grading, hallucination check")
+    console.print()
+
+    # Active features
+    features = []
+    if settings.chunking.semantic:
+        features.append("[cyan]Semantic Chunking[/cyan]")
+    if settings.chunking.contextual_retrieval:
+        features.append("[cyan]Contextual Retrieval[/cyan]")
+    if settings.retrieval.multi_query:
+        features.append("[cyan]Multi-Query[/cyan]")
+    if settings.retrieval.self_rag:
+        features.append("[cyan]Self-RAG[/cyan]")
+    if features:
+        console.print(f"[bold]Tecnicas activas:[/bold] {' + '.join(features)}\n")
 
     console.print("[bold]Ejemplos de preguntas:[/bold]")
     console.print('  [dim]"What is GRACE and how does it measure water storage?"[/dim]')
@@ -368,7 +428,10 @@ def chat(
 
     console.print("[bold]Tips:[/bold]")
     console.print("  - Escribe [cyan]/[/cyan] + [cyan]Tab[/cyan] para ver los comandos disponibles")
-    console.print("  - Usa [cyan]/sources[/cyan] despues de una respuesta para ver las fuentes en detalle")
+    console.print("  - Usa [cyan]/sources[/cyan] para ver las fuentes en detalle")
+    if settings.retrieval.self_rag:
+        console.print("  - Usa [cyan]/reflection[/cyan] para ver el log de verificacion Self-RAG")
+        console.print("  - Activa [cyan]/verbose[/cyan] para ver fuentes + Self-RAG automaticamente")
     console.print("  - Usa [cyan]/export[/cyan] para guardar la sesion como archivo")
     console.print(f"  - Modelo activo: [cyan]{settings.llm.model}[/cyan]")
     console.print()
@@ -446,6 +509,14 @@ def chat(
                 if settings.llm_base_url:
                     console.print(f"  [cyan]Proveedor:[/cyan]  {settings.llm_base_url}")
 
+            elif cmd in ("/reflection", "/r"):
+                if last_result and last_result.get("reflection"):
+                    _display_reflection(last_result["reflection"])
+                elif settings.retrieval.self_rag:
+                    console.print("[yellow]Aun no hay reflection. Haz una pregunta primero.[/yellow]")
+                else:
+                    console.print("[yellow]Self-RAG no esta activado. Activa con: rag config set retrieval.self_rag true[/yellow]")
+
             else:
                 console.print(f"[yellow]Comando desconocido: {cmd}[/yellow]")
                 _chat_quick_commands()
@@ -474,6 +545,10 @@ def chat(
         })
 
         _display_answer(result, verbose=show_sources)
+
+        # Show Self-RAG reflection summary in verbose mode
+        if show_sources and result.get("reflection"):
+            _display_reflection(result["reflection"])
 
         # Contextual tips for new users
         if query_count == 1:
@@ -661,11 +736,23 @@ def evaluate_cmd(
       Context Recall       Se recuperaron todos los documentos necesarios
 
     \b
+    La evaluacion mide el pipeline completo incluyendo las tecnicas activas
+    (Semantic Chunking, Contextual Retrieval, Self-RAG). Para comparar
+    tecnicas, ejecuta la evaluacion antes y despues de activarlas.
+
+    \b
     Flujo tipico:
       rag evaluate --generate                                         # Con gpt-4o-mini (default)
       rag evaluate --generate --model arcee-ai/trinity-large-thinking # Con Arcee Trinity
       rag evaluate --generate --size 10                               # Rapido, 10 preguntas
       rag evaluate                                                    # Re-evalua con test set existente
+
+    \b
+    Comparar tecnicas:
+      rag config set retrieval.self_rag false
+      rag evaluate --generate --size 10          # Baseline sin Self-RAG
+      rag config set retrieval.self_rag true
+      rag evaluate --size 10                     # Con Self-RAG (mismo test set)
     """
     settings = get_settings(project_root)
     if not _require_ready(settings):
@@ -786,9 +873,12 @@ def info(
     cfg.add_row("Modelo LLM", settings.llm.model)
     cfg.add_row("Temperatura", str(settings.llm.temperature))
     cfg.add_row("Chunk size / overlap", f"{settings.chunking.chunk_size} / {settings.chunking.chunk_overlap}")
+    cfg.add_row("Semantic Chunking", f"{'Si (umbral: ' + str(settings.chunking.similarity_threshold) + ')' if settings.chunking.semantic else 'No'}")
+    cfg.add_row("Contextual Retrieval", "Si" if settings.chunking.contextual_retrieval else "No")
     cfg.add_row("Retrieval (dense + BM25)", f"{settings.retrieval.dense_k} + {settings.retrieval.bm25_k}")
     cfg.add_row("Rerank top-k", str(settings.retrieval.rerank_top_k))
     cfg.add_row("Multi-query", "Si" if settings.retrieval.multi_query else "No")
+    cfg.add_row("Self-RAG", f"{'Si (max retries: ' + str(settings.retrieval.self_rag_max_retries) + ')' if settings.retrieval.self_rag else 'No'}")
     console.print(cfg)
 
 
@@ -979,14 +1069,22 @@ def config_show(
 
     table.add_row("chunking", "chunk_size", str(settings.chunking.chunk_size))
     table.add_row("", "chunk_overlap", str(settings.chunking.chunk_overlap))
+    table.add_row("", "semantic", str(settings.chunking.semantic))
+    table.add_row("", "similarity_threshold", str(settings.chunking.similarity_threshold))
+    table.add_row("", "contextual_retrieval", str(settings.chunking.contextual_retrieval))
+    table.add_row("", "context_model", str(settings.chunking.context_model or "(usa llm.model)"))
     table.add_row("retrieval", "dense_k", str(settings.retrieval.dense_k))
     table.add_row("", "bm25_k", str(settings.retrieval.bm25_k))
     table.add_row("", "rerank_top_k", str(settings.retrieval.rerank_top_k))
     table.add_row("", "multi_query", str(settings.retrieval.multi_query))
+    table.add_row("", "self_rag", str(settings.retrieval.self_rag))
+    table.add_row("", "self_rag_max_retries", str(settings.retrieval.self_rag_max_retries))
     table.add_row("llm", "model", settings.llm.model)
     table.add_row("", "temperature", str(settings.llm.temperature))
     table.add_row("", "embedding_model", settings.llm.embedding_model)
+    table.add_row("", "base_url", str(settings.llm.base_url or "(default OpenAI)"))
     table.add_row("evaluation", "test_set_size", str(settings.evaluation.test_set_size))
+    table.add_row("", "eval_model", settings.evaluation.eval_model)
     console.print(table)
 
     # API keys
@@ -1014,21 +1112,40 @@ def config_set(
     \b
     Ejemplos:
       rag config set llm.model gpt-4o-mini
-      rag config set chunking.chunk_size 1500
-      rag config set retrieval.multi_query false
+      rag config set chunking.semantic true
+      rag config set retrieval.self_rag true
 
     \b
     Claves disponibles:
-      chunking.chunk_size       Caracteres por chunk (default: 1000)
-      chunking.chunk_overlap    Solapamiento entre chunks (default: 200)
-      retrieval.dense_k         Candidatos de busqueda densa (default: 20)
-      retrieval.bm25_k          Candidatos de busqueda BM25 (default: 20)
-      retrieval.rerank_top_k    Documentos tras reranking (default: 5)
-      retrieval.multi_query     Expansion multi-query (default: true)
-      llm.model                 Modelo de lenguaje (default: gpt-4o)
-      llm.temperature           Temperatura del LLM (default: 0.1)
-      llm.embedding_model       Modelo de embeddings
-      evaluation.test_set_size  Preguntas en test sintetico (default: 30)
+      CHUNKING
+      chunking.chunk_size              Caracteres por chunk (default: 1000)
+      chunking.chunk_overlap           Solapamiento entre chunks (default: 200)
+      chunking.semantic                Chunking semantico por similitud (default: false)
+      chunking.similarity_threshold    Umbral de corte semantico (default: 0.82)
+      chunking.contextual_retrieval    Contexto LLM por chunk (default: false)
+      chunking.context_model           Modelo para contexto (default: usa llm.model)
+
+    \b
+      RETRIEVAL
+      retrieval.dense_k                Candidatos de busqueda densa (default: 20)
+      retrieval.bm25_k                 Candidatos de busqueda BM25 (default: 20)
+      retrieval.rerank_top_k           Documentos tras reranking (default: 5)
+      retrieval.multi_query            Expansion multi-query (default: true)
+      retrieval.self_rag               Self-RAG: grading + hallucination check (default: false)
+      retrieval.self_rag_max_retries   Reintentos de retrieval en Self-RAG (default: 2)
+
+    \b
+      LLM
+      llm.model                        Modelo de lenguaje (default: gpt-4o)
+      llm.temperature                  Temperatura del LLM (default: 0.1)
+      llm.embedding_model              Modelo de embeddings
+      llm.base_url                     URL del proveedor (OpenRouter, etc.)
+
+    \b
+      EVALUACION
+      evaluation.test_set_size         Preguntas en test sintetico (default: 30)
+      evaluation.eval_model            Modelo para evaluacion (default: gpt-4o-mini)
+      evaluation.eval_base_url         URL del proveedor para evaluacion
     """
     import yaml
 
@@ -1083,6 +1200,8 @@ def config_set(
     if section == "chunking":
         console.print("\n  [yellow]Los cambios en chunking requieren re-indexar.[/yellow]")
         console.print("  Ejecuta: [cyan]rag ingest --force[/cyan]")
+    elif section == "retrieval" and param in ("self_rag", "self_rag_max_retries"):
+        console.print("\n  [dim]Self-RAG se aplica en tiempo de consulta, no requiere re-indexar.[/dim]")
 
 
 # ============================================================================
@@ -1140,6 +1259,41 @@ def _display_sources(docs: list, detailed: bool = True) -> None:
             table.add_row(str(i), source[:45], page, section)
 
     console.print(table)
+
+
+def _display_reflection(reflection: list[dict]) -> None:
+    """Display Self-RAG reflection log in verbose mode."""
+    console.print("\n  [bold dim]Self-RAG Reflection:[/bold dim]")
+    for step in reflection:
+        name = step.get("step", "")
+        if name == "grade_documents":
+            ratio = step.get("ratio", 0)
+            color = "green" if ratio >= 0.5 else "yellow" if ratio >= 0.3 else "red"
+            console.print(
+                f"    [{color}]Grading[/{color}] attempt {step.get('attempt', '?')}: "
+                f"{step.get('relevant', '?')}/{step.get('retrieved', '?')} relevant "
+                f"({ratio:.0%})"
+            )
+        elif name == "reformulate":
+            console.print(
+                f"    [yellow]Reformulated[/yellow]: {step.get('reformulated', '')[:80]}"
+            )
+        elif name == "hallucination_check" or name == "hallucination_recheck":
+            grounded = step.get("grounded", "?")
+            relevant = step.get("relevant", "?")
+            g_color = "green" if grounded == "yes" else "red"
+            r_color = "green" if relevant == "yes" else "red"
+            label = "Recheck" if "recheck" in name else "Check"
+            console.print(
+                f"    [{g_color}]Grounded: {grounded}[/{g_color}] | "
+                f"[{r_color}]Relevant: {relevant}[/{r_color}]  ({label})"
+            )
+            if step.get("issues"):
+                console.print(f"    [dim]Issues: {step['issues']}[/dim]")
+        elif name == "regenerate":
+            console.print(
+                f"    [yellow]Regenerated[/yellow]: {step.get('reason', '')}"
+            )
 
 
 def _display_history(history: list[dict]) -> None:
@@ -1219,6 +1373,8 @@ def _build_chat_prompt():
             ("/i", "Atajo de /info"),
             ("/model", "Ver modelo y proveedor actual"),
             ("/m", "Atajo de /model"),
+            ("/reflection", "Ver log Self-RAG de ultima respuesta"),
+            ("/r", "Atajo de /reflection"),
             ("/clear", "Limpiar historial"),
             ("/help", "Ver todos los comandos"),
             ("/quit", "Salir de la sesion"),
@@ -1254,6 +1410,7 @@ def _chat_quick_commands() -> None:
         "[cyan]/verbose[/cyan] [dim]/v[/dim]",
         "[cyan]/info[/cyan] [dim]/i[/dim]",
         "[cyan]/model[/cyan] [dim]/m[/dim]",
+        "[cyan]/reflection[/cyan] [dim]/r[/dim]",
         "[cyan]/clear[/cyan]",
         "[cyan]/help[/cyan]",
         "[cyan]/quit[/cyan] [dim]/q[/dim]",
@@ -1265,13 +1422,14 @@ def _chat_help() -> None:
     table = Table(show_header=False, show_edge=False, padding=(0, 2), box=box.SIMPLE)
     table.add_column(style="cyan bold")
     table.add_column(style="white")
-    table.add_row("/sources  /s", "Ver fuentes de la ultima respuesta")
-    table.add_row("/history  /h", "Ver historial de la conversacion")
-    table.add_row("/export   /e [path]", "Exportar sesion a archivo Markdown")
-    table.add_row("/clear", "Limpiar historial")
-    table.add_row("/verbose  /v", "Alternar modo detallado (fuentes)")
-    table.add_row("/info     /i", "Ver estadisticas del indice")
-    table.add_row("/model    /m", "Ver modelo y proveedor actual")
+    table.add_row("/sources  /s", "Ver fuentes de la ultima respuesta (documento, pagina, fragmento)")
+    table.add_row("/reflection /r", "Ver log de verificacion Self-RAG: grading, hallucination check, retries")
+    table.add_row("/verbose  /v", "Alternar modo detallado: muestra fuentes y Self-RAG automaticamente")
+    table.add_row("/history  /h", "Ver historial de preguntas y respuestas de la sesion")
+    table.add_row("/export   /e [path]", "Exportar sesion completa a archivo Markdown")
+    table.add_row("/info     /i", "Ver estadisticas del indice (docs, chunks, modelo)")
+    table.add_row("/model    /m", "Ver modelo LLM y proveedor activo")
+    table.add_row("/clear", "Limpiar historial de la sesion")
     table.add_row("/help", "Mostrar esta ayuda")
     table.add_row("/quit     /q", "Salir de la sesion")
     console.print(Panel(table, title="Comandos disponibles", border_style="blue", padding=(1, 2)))
@@ -1308,9 +1466,22 @@ def _chat_quick_info(settings: Settings) -> None:
     results = vectorstore.get(include=["metadatas"])
     sources = {m.get("source") for m in results["metadatas"] if m}
 
-    console.print(f"  [cyan]Documentos:[/cyan] {len(sources)}")
-    console.print(f"  [cyan]Chunks:[/cyan]     {count}")
-    console.print(f"  [cyan]Modelo:[/cyan]     {settings.llm.model}")
+    console.print(f"  [cyan]Documentos:[/cyan]  {len(sources)}")
+    console.print(f"  [cyan]Chunks:[/cyan]      {count}")
+    console.print(f"  [cyan]Modelo:[/cyan]      {settings.llm.model}")
+
+    # Active features
+    active = []
+    if settings.chunking.semantic:
+        active.append("Semantic Chunking")
+    if settings.chunking.contextual_retrieval:
+        active.append("Contextual Retrieval")
+    if settings.retrieval.multi_query:
+        active.append("Multi-Query")
+    if settings.retrieval.self_rag:
+        active.append("Self-RAG")
+    if active:
+        console.print(f"  [cyan]Tecnicas:[/cyan]   {', '.join(active)}")
 
 
 if __name__ == "__main__":

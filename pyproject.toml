@@ -26,6 +26,7 @@ dependencies = [
     "rich>=13.0",
     "python-dotenv>=1.0",
     # Utilities
+    "numpy>=1.26",
     "tqdm>=4.66",
     "rapidfuzz>=3.0",
 ]

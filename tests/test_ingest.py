@@ -12,6 +12,8 @@ from rag.ingest import (
     _extract_year,
     _detect_language,
     _extract_section_header,
+    _split_sentences,
+    _enforce_chunk_sizes,
     build_chunks,
 )
 
@@ -66,6 +68,28 @@ def test_build_chunks():
     assert all(isinstance(c, Document) for c in chunks)
     assert all(c.metadata["source"] == "test.pdf" for c in chunks)
     assert all("[From:" in c.page_content for c in chunks)
+
+
+def test_split_sentences():
+    text = "GRACE measures gravity. The mission launched in 2002. Data is available globally."
+    sentences = _split_sentences(text)
+    assert len(sentences) >= 2
+    assert any("GRACE" in s for s in sentences)
+
+
+def test_enforce_chunk_sizes_merge_small():
+    chunks = ["Hi.", "Short.", "This is a longer chunk that should stay separate on its own."]
+    result = _enforce_chunk_sizes(chunks, min_size=20, max_size=500)
+    # Small chunks should be merged
+    assert len(result) <= len(chunks)
+    assert all(len(c) > 0 for c in result)
+
+
+def test_enforce_chunk_sizes_split_large():
+    large = "word " * 500  # ~2500 chars
+    result = _enforce_chunk_sizes([large], min_size=50, max_size=200)
+    assert len(result) > 1
+    assert all(len(c) <= 250 for c in result)  # Allow some slack from splitter
 
 
 def test_build_chunks_metadata():

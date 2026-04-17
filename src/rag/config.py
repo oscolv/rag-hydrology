@@ -11,6 +11,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class ChunkingConfig(BaseModel):
     chunk_size: int = 1000
     chunk_overlap: int = 200
+    semantic: bool = False  # Semantic chunking via embedding similarity
+    similarity_threshold: float = 0.82  # Breakpoint threshold for semantic chunking
+    contextual_retrieval: bool = False  # LLM-generated context per chunk (Anthropic technique)
+    context_model: str | None = None  # Model for context generation (None = use llm.model)
 
 
 class RetrievalConfig(BaseModel):
@@ -18,6 +22,8 @@ class RetrievalConfig(BaseModel):
     bm25_k: int = 20
     rerank_top_k: int = 5
     multi_query: bool = True
+    self_rag: bool = False  # Self-RAG: document grading + hallucination check + retry
+    self_rag_max_retries: int = 2  # Max retrieval retries when context is irrelevant
 
 
 class LLMConfig(BaseModel):

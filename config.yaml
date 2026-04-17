@@ -1,11 +1,17 @@
 chunking:
   chunk_size: 1000
   chunk_overlap: 200
+  semantic: true
+  similarity_threshold: 0.82
+  contextual_retrieval: true
+  context_model: null  # Uses llm.model if null
 retrieval:
   dense_k: 20
   bm25_k: 20
   rerank_top_k: 5
   multi_query: true
+  self_rag: true
+  self_rag_max_retries: 2
 llm:
   model: arcee-ai/trinity-large-thinking
   temperature: 0.1
