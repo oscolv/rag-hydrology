@@ -30,6 +30,7 @@ class LLMConfig(BaseModel):
 class EvalConfig(BaseModel):
     test_set_size: int = 30
     eval_model: str = "gpt-4o-mini"
+    eval_base_url: str | None = None  # Set to use OpenRouter for eval
 
 
 class Settings(BaseSettings):
@@ -54,6 +55,18 @@ class Settings(BaseSettings):
     def llm_base_url(self) -> str | None:
         """Return the base URL for the configured LLM provider."""
         return self.llm.base_url
+
+    @property
+    def eval_api_key(self) -> str:
+        """Return the API key for the evaluation LLM."""
+        if self.evaluation.eval_base_url and "openrouter" in (self.evaluation.eval_base_url or ""):
+            return self.openrouter_api_key
+        return self.openai_api_key
+
+    @property
+    def eval_base_url(self) -> str | None:
+        """Return the base URL for the evaluation LLM."""
+        return self.evaluation.eval_base_url
 
     project_root: Path = Path(".")
     docs_dir: str = "docs"

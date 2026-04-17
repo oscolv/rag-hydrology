@@ -17,6 +17,7 @@ from ragas.metrics import (
     LLMContextPrecisionWithoutReference,
     LLMContextRecall,
 )
+from ragas.run_config import RunConfig
 from ragas.testset import TestsetGenerator
 from rich.console import Console
 from rich.table import Table
@@ -30,15 +31,19 @@ console = Console()
 _REQUEST_DELAY = 1.5  # seconds between evaluation queries
 
 
-def _build_eval_llm(settings: Settings) -> ChatOpenAI:
-    """Build the LLM for evaluation (separate from generation to use cheaper model)."""
-    return ChatOpenAI(
-        model=settings.evaluation.eval_model,
-        temperature=0,
-        openai_api_key=settings.openai_api_key,
-        max_retries=5,
-        request_timeout=120,
-    )
+def _build_eval_llm(settings: Settings, model_override: str | None = None) -> ChatOpenAI:
+    """Build the LLM for evaluation, supporting OpenRouter via eval_base_url."""
+    model = model_override or settings.evaluation.eval_model
+    kwargs: dict = {
+        "model": model,
+        "temperature": 0,
+        "openai_api_key": settings.eval_api_key,
+        "max_retries": 5,
+        "request_timeout": 120,
+    }
+    if settings.eval_base_url:
+        kwargs["openai_api_base"] = settings.eval_base_url
+    return ChatOpenAI(**kwargs)
 
 
 def load_documents_from_chroma(settings: Settings) -> list:
@@ -61,12 +66,15 @@ def load_documents_from_chroma(settings: Settings) -> list:
     return docs
 
 
-def generate_testset(settings: Settings, output_path: Path | None = None) -> pd.DataFrame:
+def generate_testset(settings: Settings, output_path: Path | None = None, testset_size: int | None = None, model_override: str | None = None) -> pd.DataFrame:
     """Generate a synthetic test set using RAGAS TestsetGenerator."""
+    model_name = model_override or settings.evaluation.eval_model
     console.print(f"[bold]Generando test set sintetico...[/bold]")
-    console.print(f"  Modelo de evaluacion: [cyan]{settings.evaluation.eval_model}[/cyan]")
+    console.print(f"  Modelo de evaluacion: [cyan]{model_name}[/cyan]")
+    if settings.eval_base_url:
+        console.print(f"  Base URL: [cyan]{settings.eval_base_url}[/cyan]")
 
-    llm = LangchainLLMWrapper(_build_eval_llm(settings))
+    llm = LangchainLLMWrapper(_build_eval_llm(settings, model_override))
     embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(
         model=settings.llm.embedding_model,
         openai_api_key=settings.openai_api_key,
@@ -78,18 +86,23 @@ def generate_testset(settings: Settings, output_path: Path | None = None) -> pd.
     console.print(f"  {len(docs)} chunks cargados de ChromaDB")
 
     # Sample docs to reduce rate limit pressure (use a representative subset)
-    max_docs = min(len(docs), 500)
+    max_docs = min(len(docs), 150)
     if len(docs) > max_docs:
         import random
         random.seed(42)
         docs = random.sample(docs, max_docs)
         console.print(f"  Usando muestra de {max_docs} chunks para generacion")
 
-    console.print(f"  Generando {settings.evaluation.test_set_size} preguntas (esto puede tardar varios minutos)...")
+    test_size = testset_size or settings.evaluation.test_set_size
+    console.print(f"  Generando {test_size} preguntas (esto puede tardar varios minutos)...")
+
+    # RunConfig: limit concurrency to avoid rate limits on free tier
+    run_cfg = RunConfig(max_workers=4, max_retries=15, max_wait=90, timeout=300)
 
     testset = generator.generate_with_langchain_docs(
         documents=docs,
-        testset_size=settings.evaluation.test_set_size,
+        testset_size=test_size,
+        run_config=run_cfg,
     )
 
     df = testset.to_pandas()
@@ -106,6 +119,7 @@ def run_evaluation(
     chain_with_sources: Callable,
     settings: Settings,
     testset_path: Path | None = None,
+    model_override: str | None = None,
 ) -> dict:
     """Run RAGAS evaluation on the RAG chain with rate-limit handling.
 
@@ -114,6 +128,7 @@ def run_evaluation(
             {"answer": str, "source_documents": list[Document], "question": str}
         settings: Application settings
         testset_path: Path to CSV with test questions and ground truths
+        model_override: Use a specific model instead of eval_model from config
     """
     if testset_path is None:
         testset_path = settings.project_root / "data" / "testset.csv"
@@ -125,8 +140,11 @@ def run_evaluation(
 
     df = pd.read_csv(testset_path)
     total = len(df)
+    model_name = model_override or settings.evaluation.eval_model
     console.print(f"[bold]Ejecutando evaluacion en {total} preguntas...[/bold]")
-    console.print(f"  Modelo: [cyan]{settings.evaluation.eval_model}[/cyan]")
+    console.print(f"  Modelo: [cyan]{model_name}[/cyan]")
+    if settings.eval_base_url:
+        console.print(f"  Base URL: [cyan]{settings.eval_base_url}[/cyan]")
     console.print(f"  Delay entre queries: [cyan]{_REQUEST_DELAY}s[/cyan] (rate limit)\n")
 
     results = []
@@ -191,7 +209,7 @@ def run_evaluation(
         LLMContextRecall(),
     ]
 
-    eval_llm = LangchainLLMWrapper(_build_eval_llm(settings))
+    eval_llm = LangchainLLMWrapper(_build_eval_llm(settings, model_override))
     eval_embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(
         model=settings.llm.embedding_model,
         openai_api_key=settings.openai_api_key,
@@ -200,11 +218,14 @@ def run_evaluation(
     console.print("\n[bold]Calculando metricas RAGAS...[/bold]")
     console.print(f"  [dim]Esto puede tardar varios minutos con rate limiting[/dim]")
 
+    run_cfg = RunConfig(max_workers=4, max_retries=15, max_wait=90, timeout=300)
+
     scores = evaluate(
         dataset=dataset,
         metrics=metrics,
         llm=eval_llm,
         embeddings=eval_embeddings,
+        run_config=run_cfg,
     )
 
     # Display results

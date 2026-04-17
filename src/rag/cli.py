@@ -646,6 +646,8 @@ def export(
 @app.command(name="evaluate")
 def evaluate_cmd(
     generate: bool = typer.Option(False, "--generate", "-g", help="Generar test set sintetico primero"),
+    size: int = typer.Option(None, "--size", "-s", help="Numero de preguntas a generar (default: config.yaml)"),
+    model: str = typer.Option(None, "--model", "-m", help="Modelo para evaluacion (ej: arcee-ai/trinity-large-thinking)"),
     testset: str = typer.Option(None, help="Ruta a un test set CSV existente"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
@@ -660,12 +662,18 @@ def evaluate_cmd(
 
     \b
     Flujo tipico:
-      rag evaluate --generate    # Genera preguntas sinteticas + evalua
-      rag evaluate               # Re-evalua con el test set existente
+      rag evaluate --generate                                         # Con gpt-4o-mini (default)
+      rag evaluate --generate --model arcee-ai/trinity-large-thinking # Con Arcee Trinity
+      rag evaluate --generate --size 10                               # Rapido, 10 preguntas
+      rag evaluate                                                    # Re-evalua con test set existente
     """
     settings = get_settings(project_root)
     if not _require_ready(settings):
         raise typer.Exit(1)
+
+    # If using a non-OpenAI model, auto-set eval_base_url to OpenRouter
+    if model and "/" in model and not settings.eval_base_url:
+        settings.evaluation.eval_base_url = "https://openrouter.ai/api/v1"
 
     from rag.evaluation import generate_testset, run_evaluation
     from rag.retrieval import build_retriever
@@ -675,7 +683,7 @@ def evaluate_cmd(
 
     if generate:
         console.print("[bold]Paso 1/2: Generando test set sintetico...[/bold]\n")
-        generate_testset(settings, output_path=testset_path)
+        generate_testset(settings, output_path=testset_path, testset_size=size, model_override=model)
         console.print()
 
     console.print("[bold]Construyendo pipeline para evaluacion...[/bold]")
@@ -684,7 +692,7 @@ def evaluate_cmd(
 
     if generate:
         console.print("[bold]Paso 2/2: Ejecutando evaluacion...[/bold]\n")
-    run_evaluation(chain, settings, testset_path=testset_path)
+    run_evaluation(chain, settings, testset_path=testset_path, model_override=model)
 
 
 # ============================================================================
