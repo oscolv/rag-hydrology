@@ -128,11 +128,14 @@ def build_retriever(settings: Settings) -> ContextualCompressionRetriever:
 
     # Wrap with multi-query expansion
     if settings.retrieval.multi_query:
-        llm = ChatOpenAI(
-            model=settings.llm.model,
-            temperature=0,
-            openai_api_key=settings.openai_api_key,
-        )
+        llm_kwargs = {
+            "model": settings.llm.model,
+            "temperature": 0,
+            "openai_api_key": settings.llm_api_key,
+        }
+        if settings.llm_base_url:
+            llm_kwargs["openai_api_base"] = settings.llm_base_url
+        llm = ChatOpenAI(**llm_kwargs)
         base_retriever = MultiQueryRetriever.from_llm(
             retriever=hybrid,
             llm=llm,

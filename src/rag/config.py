@@ -24,10 +24,12 @@ class LLMConfig(BaseModel):
     model: str = "gpt-4o"
     temperature: float = 0.1
     embedding_model: str = "text-embedding-3-small"
+    base_url: str | None = None  # For OpenRouter: https://openrouter.ai/api/v1
 
 
 class EvalConfig(BaseModel):
     test_set_size: int = 30
+    eval_model: str = "gpt-4o-mini"
 
 
 class Settings(BaseSettings):
@@ -39,6 +41,19 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
     cohere_api_key: str = ""
+    openrouter_api_key: str = ""
+
+    @property
+    def llm_api_key(self) -> str:
+        """Return the API key for the configured LLM provider."""
+        if self.llm.base_url and "openrouter" in (self.llm.base_url or ""):
+            return self.openrouter_api_key
+        return self.openai_api_key
+
+    @property
+    def llm_base_url(self) -> str | None:
+        """Return the base URL for the configured LLM provider."""
+        return self.llm.base_url
 
     project_root: Path = Path(".")
     docs_dir: str = "docs"

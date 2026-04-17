@@ -1,17 +1,16 @@
 chunking:
   chunk_size: 1000
   chunk_overlap: 200
-
 retrieval:
   dense_k: 20
   bm25_k: 20
   rerank_top_k: 5
   multi_query: true
-
 llm:
-  model: "gpt-4o"
+  model: arcee-ai/trinity-large-thinking
   temperature: 0.1
-  embedding_model: "text-embedding-3-small"
-
+  embedding_model: text-embedding-3-small
+  base_url: https://openrouter.ai/api/v1
 evaluation:
   test_set_size: 30
+  eval_model: gpt-4o-mini

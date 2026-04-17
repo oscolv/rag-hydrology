@@ -24,6 +24,18 @@ Context:
 {context}"""
 
 
+def _build_llm(settings: Settings) -> ChatOpenAI:
+    """Build the LLM instance, supporting OpenRouter via base_url."""
+    kwargs = {
+        "model": settings.llm.model,
+        "temperature": settings.llm.temperature,
+        "openai_api_key": settings.llm_api_key,
+    }
+    if settings.llm_base_url:
+        kwargs["openai_api_base"] = settings.llm_base_url
+    return ChatOpenAI(**kwargs)
+
+
 def format_documents(docs: list[Document]) -> str:
     """Format retrieved documents with source citations for the prompt."""
     formatted = []
@@ -36,11 +48,7 @@ def format_documents(docs: list[Document]) -> str:
 
 def build_rag_chain(retriever: BaseRetriever, settings: Settings):
     """Build a RAG chain that returns only the answer string."""
-    llm = ChatOpenAI(
-        model=settings.llm.model,
-        temperature=settings.llm.temperature,
-        openai_api_key=settings.openai_api_key,
-    )
+    llm = _build_llm(settings)
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
@@ -61,11 +69,7 @@ def build_rag_chain_with_sources(retriever: BaseRetriever, settings: Settings):
 
     Returns dict with keys: "answer" (str), "source_documents" (list[Document])
     """
-    llm = ChatOpenAI(
-        model=settings.llm.model,
-        temperature=settings.llm.temperature,
-        openai_api_key=settings.openai_api_key,
-    )
+    llm = _build_llm(settings)
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
