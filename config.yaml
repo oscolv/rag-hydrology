@@ -1,0 +1,17 @@
+chunking:
+  chunk_size: 1000
+  chunk_overlap: 200
+
+retrieval:
+  dense_k: 20
+  bm25_k: 20
+  rerank_top_k: 5
+  multi_query: true
+
+llm:
+  model: "gpt-4o"
+  temperature: 0.1
+  embedding_model: "text-embedding-3-small"
+
+evaluation:
+  test_set_size: 30
