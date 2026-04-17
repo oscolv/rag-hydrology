@@ -31,19 +31,19 @@ console = Console()
 _REQUEST_DELAY = 1.5  # seconds between evaluation queries
 
 
-def _build_eval_llm(settings: Settings, model_override: str | None = None) -> ChatOpenAI:
-    """Build the LLM for evaluation, supporting OpenRouter via eval_base_url."""
-    model = model_override or settings.evaluation.eval_model
-    kwargs: dict = {
-        "model": model,
-        "temperature": 0,
-        "openai_api_key": settings.eval_api_key,
-        "max_retries": 5,
-        "request_timeout": 120,
-    }
-    if settings.eval_base_url:
-        kwargs["openai_api_base"] = settings.eval_base_url
-    return ChatOpenAI(**kwargs)
+def _build_eval_llm(settings: Settings) -> ChatOpenAI:
+    """Build the LLM for RAGAS evaluation.
+
+    Always uses OpenAI directly (gpt-4o-mini by default) because RAGAS
+    requires strict JSON output parsing that is only reliable with OpenAI models.
+    """
+    return ChatOpenAI(
+        model=settings.evaluation.eval_model,
+        temperature=0,
+        openai_api_key=settings.openai_api_key,
+        max_retries=5,
+        request_timeout=120,
+    )
 
 
 def load_documents_from_chroma(settings: Settings) -> list:
@@ -66,15 +66,16 @@ def load_documents_from_chroma(settings: Settings) -> list:
     return docs
 
 
-def generate_testset(settings: Settings, output_path: Path | None = None, testset_size: int | None = None, model_override: str | None = None) -> pd.DataFrame:
-    """Generate a synthetic test set using RAGAS TestsetGenerator."""
-    model_name = model_override or settings.evaluation.eval_model
-    console.print(f"[bold]Generando test set sintetico...[/bold]")
-    console.print(f"  Modelo de evaluacion: [cyan]{model_name}[/cyan]")
-    if settings.eval_base_url:
-        console.print(f"  Base URL: [cyan]{settings.eval_base_url}[/cyan]")
+def generate_testset(settings: Settings, output_path: Path | None = None, testset_size: int | None = None) -> pd.DataFrame:
+    """Generate a synthetic test set using RAGAS TestsetGenerator.
 
-    llm = LangchainLLMWrapper(_build_eval_llm(settings, model_override))
+    Always uses gpt-4o-mini (OpenAI) for generation — RAGAS requires strict
+    JSON parsing that is only reliable with OpenAI models.
+    """
+    console.print(f"[bold]Generando test set sintetico...[/bold]")
+    console.print(f"  Modelo RAGAS: [cyan]{settings.evaluation.eval_model}[/cyan] (OpenAI)")
+
+    llm = LangchainLLMWrapper(_build_eval_llm(settings))
     embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(
         model=settings.llm.embedding_model,
         openai_api_key=settings.openai_api_key,
@@ -119,16 +120,17 @@ def run_evaluation(
     chain_with_sources: Callable,
     settings: Settings,
     testset_path: Path | None = None,
-    model_override: str | None = None,
 ) -> dict:
     """Run RAGAS evaluation on the RAG chain with rate-limit handling.
+
+    The RAG chain uses the configured LLM (e.g. Trinity via OpenRouter) to
+    generate answers, while RAGAS metrics are computed with gpt-4o-mini (OpenAI).
 
     Args:
         chain_with_sources: Callable that takes a question string and returns
             {"answer": str, "source_documents": list[Document], "question": str}
         settings: Application settings
         testset_path: Path to CSV with test questions and ground truths
-        model_override: Use a specific model instead of eval_model from config
     """
     if testset_path is None:
         testset_path = settings.project_root / "data" / "testset.csv"
@@ -140,11 +142,9 @@ def run_evaluation(
 
     df = pd.read_csv(testset_path)
     total = len(df)
-    model_name = model_override or settings.evaluation.eval_model
     console.print(f"[bold]Ejecutando evaluacion en {total} preguntas...[/bold]")
-    console.print(f"  Modelo: [cyan]{model_name}[/cyan]")
-    if settings.eval_base_url:
-        console.print(f"  Base URL: [cyan]{settings.eval_base_url}[/cyan]")
+    console.print(f"  RAG pipeline: [cyan]{settings.llm.model}[/cyan]")
+    console.print(f"  Metricas RAGAS: [cyan]{settings.evaluation.eval_model}[/cyan] (OpenAI)")
     console.print(f"  Delay entre queries: [cyan]{_REQUEST_DELAY}s[/cyan] (rate limit)\n")
 
     results = []
@@ -209,7 +209,7 @@ def run_evaluation(
         LLMContextRecall(),
     ]
 
-    eval_llm = LangchainLLMWrapper(_build_eval_llm(settings, model_override))
+    eval_llm = LangchainLLMWrapper(_build_eval_llm(settings))
     eval_embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(
         model=settings.llm.embedding_model,
         openai_api_key=settings.openai_api_key,

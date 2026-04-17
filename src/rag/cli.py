@@ -722,7 +722,6 @@ def export(
 def evaluate_cmd(
     generate: bool = typer.Option(False, "--generate", "-g", help="Generar test set sintetico primero"),
     size: int = typer.Option(None, "--size", "-s", help="Numero de preguntas a generar (default: config.yaml)"),
-    model: str = typer.Option(None, "--model", "-m", help="Modelo para evaluacion (ej: arcee-ai/trinity-large-thinking)"),
     testset: str = typer.Option(None, help="Ruta a un test set CSV existente"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
@@ -736,31 +735,28 @@ def evaluate_cmd(
       Context Recall       Se recuperaron todos los documentos necesarios
 
     \b
-    La evaluacion mide el pipeline completo incluyendo las tecnicas activas
-    (Semantic Chunking, Contextual Retrieval, Self-RAG). Para comparar
-    tecnicas, ejecuta la evaluacion antes y despues de activarlas.
+    Como funciona:
+      - Las RESPUESTAS las genera el pipeline RAG con tu modelo configurado
+        (ej: arcee-ai/trinity-large-thinking via OpenRouter)
+      - Las METRICAS RAGAS las calcula gpt-4o-mini (OpenAI) porque RAGAS
+        requiere parsing JSON estricto que solo es confiable con modelos OpenAI
 
     \b
     Flujo tipico:
-      rag evaluate --generate                                         # Con gpt-4o-mini (default)
-      rag evaluate --generate --model arcee-ai/trinity-large-thinking # Con Arcee Trinity
-      rag evaluate --generate --size 10                               # Rapido, 10 preguntas
-      rag evaluate                                                    # Re-evalua con test set existente
+      rag evaluate --generate              # Genera test set + evalua
+      rag evaluate --generate --size 10    # Rapido, 10 preguntas
+      rag evaluate                         # Re-evalua con test set existente
 
     \b
     Comparar tecnicas:
       rag config set retrieval.self_rag false
-      rag evaluate --generate --size 10          # Baseline sin Self-RAG
+      rag evaluate --generate --size 10    # Baseline sin Self-RAG
       rag config set retrieval.self_rag true
-      rag evaluate --size 10                     # Con Self-RAG (mismo test set)
+      rag evaluate                         # Con Self-RAG (mismo test set)
     """
     settings = get_settings(project_root)
     if not _require_ready(settings):
         raise typer.Exit(1)
-
-    # If using a non-OpenAI model, auto-set eval_base_url to OpenRouter
-    if model and "/" in model and not settings.eval_base_url:
-        settings.evaluation.eval_base_url = "https://openrouter.ai/api/v1"
 
     from rag.evaluation import generate_testset, run_evaluation
     from rag.retrieval import build_retriever
@@ -770,16 +766,18 @@ def evaluate_cmd(
 
     if generate:
         console.print("[bold]Paso 1/2: Generando test set sintetico...[/bold]\n")
-        generate_testset(settings, output_path=testset_path, testset_size=size, model_override=model)
+        generate_testset(settings, output_path=testset_path, testset_size=size)
         console.print()
 
     console.print("[bold]Construyendo pipeline para evaluacion...[/bold]")
+    console.print(f"  RAG pipeline: [cyan]{settings.llm.model}[/cyan]")
+    console.print(f"  Metricas RAGAS: [cyan]{settings.evaluation.eval_model}[/cyan] (OpenAI)\n")
     retriever = build_retriever(settings)
     chain = build_rag_chain_with_sources(retriever, settings)
 
     if generate:
         console.print("[bold]Paso 2/2: Ejecutando evaluacion...[/bold]\n")
-    run_evaluation(chain, settings, testset_path=testset_path, model_override=model)
+    run_evaluation(chain, settings, testset_path=testset_path)
 
 
 # ============================================================================
@@ -1144,8 +1142,7 @@ def config_set(
     \b
       EVALUACION
       evaluation.test_set_size         Preguntas en test sintetico (default: 30)
-      evaluation.eval_model            Modelo para evaluacion (default: gpt-4o-mini)
-      evaluation.eval_base_url         URL del proveedor para evaluacion
+      evaluation.eval_model            Modelo OpenAI para RAGAS (default: gpt-4o-mini)
     """
     import yaml
 
