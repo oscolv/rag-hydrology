@@ -240,8 +240,11 @@ def run_evaluation(
     return scores
 
 
-def display_scores(scores: dict) -> None:
-    """Display evaluation scores in a rich table."""
+def display_scores(scores) -> None:
+    """Display evaluation scores in a rich table.
+
+    Works with RAGAS 0.4 EvaluationResult (uses .to_pandas() to extract averages).
+    """
     table = Table(title="Resultados RAGAS", show_edge=False, box=box.SIMPLE)
     table.add_column("Metrica", style="cyan")
     table.add_column("Score", style="green", justify="right")
@@ -250,22 +253,29 @@ def display_scores(scores: dict) -> None:
     descriptions = {
         "faithfulness": "Fidelidad al contexto (no alucina)",
         "answer_relevancy": "Relevancia de la respuesta",
+        "response_relevancy": "Relevancia de la respuesta",
         "context_precision": "Precision del contexto recuperado",
         "llm_context_precision_without_reference": "Precision del contexto (sin referencia)",
         "context_recall": "Cobertura del contexto necesario",
         "llm_context_recall": "Cobertura del contexto (LLM)",
     }
 
-    score_dict = {k: v for k, v in scores.items() if isinstance(v, (int, float))}
-    for metric, score in sorted(score_dict.items()):
-        desc = descriptions.get(metric, "")
-        # Color code the score
-        if score >= 0.8:
-            score_str = f"[bold green]{score:.4f}[/bold green]"
-        elif score >= 0.5:
-            score_str = f"[yellow]{score:.4f}[/yellow]"
+    # Extract per-metric averages from EvaluationResult
+    df = scores.to_pandas()
+    for col in sorted(df.columns):
+        if col in ("user_input", "response", "retrieved_contexts", "reference"):
+            continue
+        values = pd.to_numeric(df[col], errors="coerce").dropna()
+        if values.empty:
+            continue
+        avg = float(values.mean())
+        desc = descriptions.get(col, "")
+        if avg >= 0.8:
+            score_str = f"[bold green]{avg:.4f}[/bold green]"
+        elif avg >= 0.5:
+            score_str = f"[yellow]{avg:.4f}[/yellow]"
         else:
-            score_str = f"[red]{score:.4f}[/red]"
-        table.add_row(metric, score_str, desc)
+            score_str = f"[red]{avg:.4f}[/red]"
+        table.add_row(col, score_str, desc)
 
     console.print(table)
