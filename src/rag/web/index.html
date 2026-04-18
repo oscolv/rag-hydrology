@@ -138,6 +138,8 @@
                           <span class="ns" x-text="'rag://' + (activeCollection?.name || '...') "></span>
                           <span class="sep">·</span>
                           <span x-text="'msg-' + String(idx + 1).padStart(3, '0')"></span>
+                          <span class="sep">·</span>
+                          <span x-text="m.model || health.model || '—'"></span>
                           <span class="clock" x-show="m.elapsed" x-text="m.elapsed + 's'"></span>
                         </div>
                         <div class="msg-body">
@@ -379,6 +381,12 @@
           <span x-text="'N=' + (activeCollection?.pdf_count ?? 0) + ' PDF'"></span>
           <span class="sep-hard">│</span>
           <span x-text="streaming ? 'STATE: STREAMING' : 'STATE: IDLE'"></span>
+          <span class="sep-hard">│</span>
+          <span class="sb-model" :title="'base_url: ' + (health.base_url || 'default openai')">
+            <span style="color: var(--ink-mute);">LLM:</span>
+            <span style="color: var(--accent);" x-text="health.model || '—'"></span>
+            <span x-show="health.provider" style="color: var(--ink-mute);" x-text="'@' + health.provider"></span>
+          </span>
           <span class="right">RAG//01 · V1</span>
         </div>
       </div>

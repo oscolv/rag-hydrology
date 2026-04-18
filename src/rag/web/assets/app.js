@@ -12,6 +12,7 @@ function ragApp() {
     question: "",
     streaming: false,
     stats: {},
+    health: { model: "", provider: "", embedding_model: "" },
     examples: [
       "¿Cuáles son los hallazgos principales de estos documentos?",
       "Resume la metodología clave utilizada.",
@@ -21,7 +22,14 @@ function ragApp() {
     toast: "",
 
     async init() {
-      await this.loadCollections();
+      await Promise.all([this.loadCollections(), this.loadHealth()]);
+    },
+
+    async loadHealth() {
+      try {
+        const r = await fetch("/api/health");
+        if (r.ok) this.health = await r.json();
+      } catch (_e) { /* non-fatal */ }
     },
 
     async loadCollections() {
@@ -79,6 +87,7 @@ function ragApp() {
         documents: [],
         reflection: [],
         citations: [],
+        model: this.health.model || "",
         streaming: true,
         status: "Conectando con el servidor...",
         phase: "connecting",

@@ -1122,6 +1122,18 @@ main > section[style*="display: none"] { display: none !important; }
 }
 .status-bar .sep-hard { color: var(--ink-ghost); }
 .status-bar .right { margin-left: auto; }
+.status-bar .sb-model {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: none;
+  letter-spacing: 0.04em;
+  cursor: help;
+}
 
 /* ============================================================================
  * MODAL

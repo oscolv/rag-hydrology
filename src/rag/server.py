@@ -343,10 +343,20 @@ def create_app(project_root: str = ".") -> FastAPI:
     @app.get("/api/health")
     def health():
         settings = get_settings(root)
+        base_url = settings.llm_base_url or ""
+        if "openrouter" in base_url:
+            provider = "openrouter"
+        elif base_url:
+            provider = base_url.replace("https://", "").replace("http://", "").split("/")[0]
+        else:
+            provider = "openai"
         return {
             "ok": True,
             "active_collection": settings.active_collection,
             "model": settings.llm.model,
+            "embedding_model": settings.llm.embedding_model,
+            "provider": provider,
+            "base_url": base_url or None,
         }
 
     # ---------- Static web UI ----------
