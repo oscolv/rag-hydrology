@@ -1,10 +1,7 @@
 __pycache__/
 *.pyc
 .env
-data/chroma/
-data/bm25_index.pkl
-data/testset.csv
-data/eval_results.csv
+data/
 *.egg-info/
 dist/
 build/

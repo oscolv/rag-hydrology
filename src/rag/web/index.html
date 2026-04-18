@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="es" class="h-full">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RAG — Consulta documentos con IA</title>
+    <script src="https://cdn.tailwindcss.com?plugins=typography"></script>
+    <script>
+      tailwind.config = {
+        theme: { extend: {} },
+      };
+    </script>
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <script src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.2/dist/purify.min.js"></script>
+  </head>
+  <body class="h-full bg-slate-50 text-slate-900 antialiased">
+    <div x-data="ragApp()" x-init="init()" class="flex h-full flex-col">
+      <!-- Header -->
+      <header class="flex items-center gap-4 border-b border-slate-200 bg-white px-6 py-3 shadow-sm">
+        <div class="flex items-center gap-2">
+          <div class="h-8 w-8 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600"></div>
+          <h1 class="text-lg font-semibold tracking-tight">RAG</h1>
+        </div>
+
+        <!-- Collection switcher -->
+        <div class="relative" @click.outside="collectionsOpen = false">
+          <button
+            type="button"
+            @click="collectionsOpen = !collectionsOpen"
+            class="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-1.5 text-sm hover:bg-slate-100"
+          >
+            <svg class="h-4 w-4 text-slate-400" viewBox="0 0 20 20" fill="currentColor">
+              <path d="M2 4a2 2 0 0 1 2-2h4.586a1 1 0 0 1 .707.293l.707.707H16a2 2 0 0 1 2 2v1H2V4zM2 7v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7H2z"/>
+            </svg>
+            <span x-text="activeCollection?.display_name || '—'"></span>
+            <svg class="h-3.5 w-3.5 text-slate-400" viewBox="0 0 20 20" fill="currentColor">
+              <path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.168l3.71-3.938a.75.75 0 1 1 1.08 1.04l-4.24 4.5a.75.75 0 0 1-1.08 0l-4.24-4.5a.75.75 0 0 1 .02-1.06z" clip-rule="evenodd"/>
+            </svg>
+          </button>
+
+          <div
+            x-show="collectionsOpen"
+            x-transition.opacity.duration.150ms
+            class="absolute left-0 top-full z-20 mt-1 w-80 rounded-lg border border-slate-200 bg-white shadow-lg"
+          >
+            <div class="border-b border-slate-100 px-3 py-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Colecciones
+            </div>
+            <template x-for="c in collections" :key="c.name">
+              <button
+                type="button"
+                @click="switchCollection(c.name)"
+                class="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-slate-50"
+                :class="c.is_active ? 'bg-indigo-50 text-indigo-700' : ''"
+              >
+                <div class="flex min-w-0 flex-col">
+                  <span class="truncate font-medium" x-text="c.display_name"></span>
+                  <span class="text-xs text-slate-500" x-text="c.pdf_count + ' PDFs · ' + (c.has_index ? 'indexada' : 'sin indice')"></span>
+                </div>
+                <svg x-show="c.is_active" class="h-4 w-4 text-indigo-600" viewBox="0 0 20 20" fill="currentColor">
+                  <path fill-rule="evenodd" d="M16.7 5.3a1 1 0 0 1 0 1.4l-8 8a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 1.4-1.4L8 12.6l7.3-7.3a1 1 0 0 1 1.4 0z" clip-rule="evenodd"/>
+                </svg>
+              </button>
+            </template>
+            <div class="border-t border-slate-100 p-2">
+              <button
+                type="button"
+                @click="showCreateCollection = true; collectionsOpen = false"
+                class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-slate-600 hover:bg-slate-100"
+              >
+                <svg class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                  <path d="M10 3a1 1 0 0 1 1 1v5h5a1 1 0 1 1 0 2h-5v5a1 1 0 1 1-2 0v-5H4a1 1 0 1 1 0-2h5V4a1 1 0 0 1 1-1z"/>
+                </svg>
+                Nueva coleccion
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <nav class="ml-auto flex items-center gap-1">
+          <button
+            type="button"
+            @click="tab = 'chat'"
+            class="rounded-md px-3 py-1.5 text-sm font-medium"
+            :class="tab === 'chat' ? 'bg-slate-100 text-slate-900' : 'text-slate-500 hover:text-slate-800'"
+          >
+            Chat
+          </button>
+          <button
+            type="button"
+            @click="tab = 'stats'; loadStats()"
+            class="rounded-md px-3 py-1.5 text-sm font-medium"
+            :class="tab === 'stats' ? 'bg-slate-100 text-slate-900' : 'text-slate-500 hover:text-slate-800'"
+          >
+            Metricas
+          </button>
+          <a
+            href="/docs"
+            target="_blank"
+            class="rounded-md px-3 py-1.5 text-sm font-medium text-slate-500 hover:text-slate-800"
+          >
+            API
+          </a>
+        </nav>
+      </header>
+
+      <!-- Main -->
+      <main class="flex min-h-0 flex-1">
+        <!-- Chat tab -->
+        <section x-show="tab === 'chat'" class="flex min-w-0 flex-1 flex-col">
+          <!-- Messages -->
+          <div
+            x-ref="messages"
+            class="flex-1 overflow-y-auto px-6 py-6"
+          >
+            <div class="mx-auto max-w-4xl space-y-6">
+              <template x-if="messages.length === 0">
+                <div class="mt-8 rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm">
+                  <h2 class="text-xl font-semibold">Pregunta a tus documentos</h2>
+                  <p class="mt-2 text-sm text-slate-500">
+                    El sistema busca en la coleccion activa y responde con citas numericas [1][2].
+                  </p>
+                  <div class="mt-6 grid gap-2 text-left sm:grid-cols-2">
+                    <template x-for="q in examples">
+                      <button
+                        type="button"
+                        @click="question = q; submit()"
+                        class="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm hover:border-indigo-300 hover:bg-white"
+                        x-text="q"
+                      ></button>
+                    </template>
+                  </div>
+                </div>
+              </template>
+
+              <template x-for="(m, idx) in messages" :key="idx">
+                <div>
+                  <!-- User message -->
+                  <div class="mb-2 flex justify-end">
+                    <div class="max-w-[80%] rounded-2xl rounded-br-sm bg-indigo-600 px-4 py-2 text-white">
+                      <p class="whitespace-pre-wrap text-sm" x-text="m.question"></p>
+                    </div>
+                  </div>
+                  <!-- Assistant message -->
+                  <div class="flex gap-3">
+                    <div class="h-8 w-8 shrink-0 rounded-full bg-gradient-to-br from-indigo-500 to-violet-600"></div>
+                    <div class="min-w-0 flex-1">
+                      <div class="rounded-2xl rounded-tl-sm border border-slate-200 bg-white p-4 shadow-sm">
+                        <template x-if="m.streaming && !m.answer">
+                          <div>
+                            <div class="flex items-center gap-2 text-sm text-slate-600">
+                              <div class="h-2.5 w-2.5 animate-pulse rounded-full bg-indigo-500"></div>
+                              <span x-text="m.status || 'Pensando...'"></span>
+                              <span class="ml-auto rounded bg-indigo-50 px-2 py-0.5 font-mono text-xs font-medium text-indigo-700" x-text="m.elapsed + 's'"></span>
+                            </div>
+                            <template x-if="m.stallHint">
+                              <p class="mt-2 border-l-4 border-amber-400 bg-amber-50 px-3 py-2 text-sm text-amber-900" x-text="m.stallHint"></p>
+                            </template>
+                          </div>
+                        </template>
+                        <template x-if="m.streaming && m.answer">
+                          <div class="mb-2 flex items-center gap-2 text-xs text-slate-400">
+                            <div class="h-1.5 w-1.5 animate-pulse rounded-full bg-indigo-500"></div>
+                            <span>Streaming</span>
+                            <span class="ml-auto tabular-nums" x-text="m.elapsed + 's'"></span>
+                          </div>
+                        </template>
+                        <div
+                          class="prose prose-sm max-w-none prose-slate prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-pre:my-2"
+                          x-html="renderAnswer(m.answer, m.documents)"
+                        ></div>
+                        <!-- Reflection log (Self-RAG) -->
+                        <template x-if="m.reflection && m.reflection.length">
+                          <details class="mt-3 border-t border-slate-100 pt-3">
+                            <summary class="cursor-pointer text-xs font-medium text-slate-500 hover:text-slate-700">
+                              Self-RAG log (<span x-text="m.reflection.length"></span> pasos)
+                            </summary>
+                            <ul class="mt-2 space-y-1 text-xs text-slate-600">
+                              <template x-for="step in m.reflection">
+                                <li x-text="formatReflectionStep(step)"></li>
+                              </template>
+                            </ul>
+                          </details>
+                        </template>
+                      </div>
+
+                      <!-- Sources -->
+                      <template x-if="m.documents && m.documents.length">
+                        <div class="mt-3 space-y-2">
+                          <div class="text-xs font-medium uppercase tracking-wide text-slate-500">
+                            Fuentes (<span x-text="m.documents.length"></span>)
+                          </div>
+                          <template x-for="(doc, i) in m.documents" :key="i">
+                            <details
+                              class="group rounded-lg border border-slate-200 bg-white"
+                              :class="m.citations?.includes(i + 1) ? 'ring-1 ring-indigo-200' : ''"
+                              :id="'source-' + idx + '-' + (i + 1)"
+                            >
+                              <summary class="flex cursor-pointer items-center gap-3 px-3 py-2 text-sm">
+                                <span
+                                  class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-xs font-semibold"
+                                  :class="m.citations?.includes(i + 1) ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-100 text-slate-600'"
+                                  x-text="i + 1"
+                                ></span>
+                                <div class="min-w-0 flex-1">
+                                  <div class="truncate font-medium" x-text="doc.source"></div>
+                                  <div class="truncate text-xs text-slate-500">
+                                    <span x-text="'pag. ' + doc.page"></span>
+                                    <template x-if="doc.section">
+                                      <span> · <span x-text="doc.section"></span></span>
+                                    </template>
+                                    <template x-if="doc.year">
+                                      <span> · <span x-text="doc.year"></span></span>
+                                    </template>
+                                  </div>
+                                </div>
+                                <svg class="h-4 w-4 text-slate-400 transition group-open:rotate-180" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.168l3.71-3.938a.75.75 0 1 1 1.08 1.04l-4.24 4.5a.75.75 0 0 1-1.08 0l-4.24-4.5a.75.75 0 0 1 .02-1.06z" clip-rule="evenodd"/>
+                                </svg>
+                              </summary>
+                              <div class="border-t border-slate-100 px-3 py-2 text-xs text-slate-600">
+                                <pre class="whitespace-pre-wrap font-sans" x-text="stripHeader(doc.content)"></pre>
+                              </div>
+                            </details>
+                          </template>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- Input -->
+          <div class="border-t border-slate-200 bg-white px-6 py-4">
+            <form
+              @submit.prevent="submit()"
+              class="mx-auto flex max-w-4xl items-end gap-3"
+            >
+              <div class="flex-1 rounded-xl border border-slate-200 bg-slate-50 px-4 py-2 focus-within:border-indigo-400 focus-within:bg-white">
+                <textarea
+                  x-model="question"
+                  @keydown.enter.prevent="if (!$event.shiftKey) submit()"
+                  rows="1"
+                  placeholder="Escribe tu pregunta... (Shift+Enter para nueva linea)"
+                  class="w-full resize-none bg-transparent text-sm outline-none"
+                  :disabled="streaming"
+                ></textarea>
+              </div>
+              <button
+                type="submit"
+                :disabled="streaming || !question.trim()"
+                class="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+              >
+                <span x-text="streaming ? 'Generando...' : 'Preguntar'"></span>
+              </button>
+            </form>
+            <div class="mx-auto mt-2 max-w-4xl text-center text-xs text-slate-400">
+              Las respuestas se generan a partir de la coleccion activa. Revisa las fuentes antes de usar en produccion.
+            </div>
+          </div>
+        </section>
+
+        <!-- Stats tab -->
+        <section x-show="tab === 'stats'" class="flex-1 overflow-y-auto px-6 py-6">
+          <div class="mx-auto max-w-5xl space-y-6">
+            <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                <div class="text-xs font-medium uppercase tracking-wide text-slate-500">Consultas</div>
+                <div class="mt-2 text-2xl font-semibold" x-text="stats.total || 0"></div>
+              </div>
+              <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                <div class="text-xs font-medium uppercase tracking-wide text-slate-500">Latencia p50</div>
+                <div class="mt-2 text-2xl font-semibold" x-text="(stats.p50_latency_ms || 0) + ' ms'"></div>
+              </div>
+              <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                <div class="text-xs font-medium uppercase tracking-wide text-slate-500">Latencia p95</div>
+                <div class="mt-2 text-2xl font-semibold" x-text="(stats.p95_latency_ms || 0) + ' ms'"></div>
+              </div>
+              <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                <div class="text-xs font-medium uppercase tracking-wide text-slate-500">Errores</div>
+                <div class="mt-2 text-2xl font-semibold text-red-600" x-text="stats.errors || 0"></div>
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-slate-200 bg-white shadow-sm">
+              <div class="border-b border-slate-200 px-4 py-3">
+                <div class="text-sm font-semibold">Por coleccion</div>
+              </div>
+              <template x-if="stats.per_collection && stats.per_collection.length">
+                <table class="w-full text-sm">
+                  <thead>
+                    <tr class="border-b border-slate-100 text-left text-xs uppercase tracking-wide text-slate-500">
+                      <th class="px-4 py-2 font-medium">Coleccion</th>
+                      <th class="px-4 py-2 text-right font-medium">Consultas</th>
+                      <th class="px-4 py-2 text-right font-medium">Latencia media</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="row in stats.per_collection">
+                      <tr class="border-b border-slate-50 last:border-0">
+                        <td class="px-4 py-2 font-medium" x-text="row.collection"></td>
+                        <td class="px-4 py-2 text-right" x-text="row.count"></td>
+                        <td class="px-4 py-2 text-right" x-text="row.avg_ms + ' ms'"></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </template>
+              <template x-if="!stats.per_collection || !stats.per_collection.length">
+                <div class="p-4 text-sm text-slate-500">Sin datos todavia.</div>
+              </template>
+            </div>
+
+            <div class="rounded-xl border border-slate-200 bg-white shadow-sm">
+              <div class="border-b border-slate-200 px-4 py-3">
+                <div class="text-sm font-semibold">Consultas recientes</div>
+              </div>
+              <template x-if="stats.recent && stats.recent.length">
+                <ul class="divide-y divide-slate-100">
+                  <template x-for="r in stats.recent">
+                    <li class="flex items-start gap-3 px-4 py-3 text-sm">
+                      <span class="mt-0.5 inline-flex h-5 shrink-0 items-center rounded bg-slate-100 px-2 text-xs font-medium" x-text="r.collection"></span>
+                      <div class="min-w-0 flex-1">
+                        <p class="truncate" x-text="r.question"></p>
+                        <p class="mt-0.5 text-xs text-slate-500">
+                          <span x-text="formatRelativeTime(r.ts)"></span>
+                          · <span x-text="r.latency_ms + ' ms'"></span>
+                          · <span x-text="r.doc_count + ' docs'"></span>
+                          <template x-if="r.error">
+                            · <span class="text-red-600" x-text="r.error"></span>
+                          </template>
+                        </p>
+                      </div>
+                    </li>
+                  </template>
+                </ul>
+              </template>
+              <template x-if="!stats.recent || !stats.recent.length">
+                <div class="p-4 text-sm text-slate-500">Sin consultas registradas.</div>
+              </template>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <!-- Create collection modal -->
+      <div
+        x-show="showCreateCollection"
+        x-transition.opacity
+        class="fixed inset-0 z-30 flex items-center justify-center bg-slate-900/40"
+        @click.self="showCreateCollection = false"
+      >
+        <div class="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
+          <h3 class="text-lg font-semibold">Nueva coleccion</h3>
+          <p class="mt-1 text-sm text-slate-500">Un corpus independiente de PDFs con su propio indice.</p>
+
+          <form @submit.prevent="createCollection()" class="mt-4 space-y-3">
+            <div>
+              <label class="text-xs font-medium uppercase tracking-wide text-slate-500">Nombre (slug)</label>
+              <input
+                x-model="newCollection.name"
+                required
+                pattern="[a-zA-Z0-9_-]+"
+                placeholder="ej: papers-nlp"
+                class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm outline-none focus:border-indigo-400"
+              />
+            </div>
+            <div>
+              <label class="text-xs font-medium uppercase tracking-wide text-slate-500">Display name</label>
+              <input
+                x-model="newCollection.display_name"
+                placeholder="ej: Papers de NLP"
+                class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm outline-none focus:border-indigo-400"
+              />
+            </div>
+            <div>
+              <label class="text-xs font-medium uppercase tracking-wide text-slate-500">Descripcion</label>
+              <textarea
+                x-model="newCollection.description"
+                rows="2"
+                class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm outline-none focus:border-indigo-400"
+              ></textarea>
+            </div>
+            <div class="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                @click="showCreateCollection = false"
+                class="rounded-md px-3 py-2 text-sm text-slate-600 hover:bg-slate-100"
+              >Cancelar</button>
+              <button
+                type="submit"
+                class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700"
+              >Crear</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- Toast -->
+      <div
+        x-show="toast"
+        x-transition.opacity.duration.200ms
+        class="fixed bottom-4 left-1/2 z-40 -translate-x-1/2 rounded-lg bg-slate-900 px-4 py-2 text-sm text-white shadow-lg"
+        x-text="toast"
+      ></div>
+    </div>
+
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

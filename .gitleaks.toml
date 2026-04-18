@@ -1,0 +1,47 @@
+# Gitleaks configuration for the RAG repo.
+#
+# Inherits all default detectors (OpenAI, AWS, GCP, GitHub, Slack, generic
+# high-entropy strings, etc.) and layers repo-specific rules on top.
+#
+# Run locally: `gitleaks detect --config .gitleaks.toml`
+
+[extend]
+useDefault = true
+
+# --- Custom rules ----------------------------------------------------------
+
+[[rules]]
+id = "openrouter-key"
+description = "OpenRouter API key"
+regex = '''sk-or-v1-[A-Za-z0-9_-]{20,}'''
+tags = ["key", "openrouter"]
+
+[[rules]]
+id = "anthropic-key"
+description = "Anthropic API key"
+regex = '''sk-ant-api\d+-[A-Za-z0-9_-]{20,}'''
+tags = ["key", "anthropic"]
+
+[[rules]]
+id = "cohere-key"
+description = "Cohere API key (best-effort — they use 40-char base62)"
+regex = '''(?i)cohere[_-]?api[_-]?key\s*[:=]\s*["']?[A-Za-z0-9]{40}["']?'''
+tags = ["key", "cohere"]
+
+# --- Allowlist -------------------------------------------------------------
+# Files and paths that are allowed to contain strings matching detector rules.
+
+[allowlist]
+description = "Known safe paths and placeholders"
+paths = [
+    '''\.env\.example$''',
+    '''tests/test_sanitize\.py$''',   # intentionally contains fake keys
+    '''docs/THREAT_MODEL\.md$''',     # may reference key shapes
+]
+regexes = [
+    '''sk-(proj|or-v1|ant-api\d+)-EXAMPLE''',   # explicit placeholders
+    '''sk-abcdefghij1234567890''',              # test fixture
+    '''sk-proj-abcdef1234567890ABCDEF''',       # test fixture
+    '''sk-or-v1-1234567890abcdefghijk12345''',  # test fixture
+    '''abcdefghijklmnop1234567890xyz''',        # test fixture
+]

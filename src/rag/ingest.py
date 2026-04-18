@@ -7,8 +7,11 @@ Supports three chunking strategies:
 """
 
 import hashlib
-import pickle
+import os
+import pickle  # nosec B403 — we only serialize objects we generated ourselves
 import re
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -19,9 +22,11 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from rank_bm25 import BM25Okapi
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 
 from rag.config import Settings
+from rag.factories import get_context_llm, get_embeddings
+from rag.retrieval import _BM25_MAGIC
 
 console = Console()
 
@@ -31,8 +36,13 @@ console = Console()
 
 
 def _file_hash(path: Path) -> str:
-    """Compute MD5 hash of a file for deduplication."""
-    h = hashlib.md5()
+    """Compute an MD5 fingerprint of a file for deduplication.
+
+    MD5 is fine here: this is a non-cryptographic content fingerprint used
+    only to detect identical PDFs during ingestion. usedforsecurity=False
+    tells static analyzers (and FIPS-mode hosts) this is not a security use.
+    """
+    h = hashlib.md5(usedforsecurity=False)
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
@@ -100,6 +110,49 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(dot / norm) if norm > 0 else 0.0
 
 
+def _consecutive_cosine_sim(embs: np.ndarray) -> np.ndarray:
+    """Vectorized cosine similarity between each pair of consecutive rows."""
+    if len(embs) < 2:
+        return np.empty(0, dtype=float)
+    a = embs[:-1]
+    b = embs[1:]
+    num = np.einsum("ij,ij->i", a, b)
+    den = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-12
+    return num / den
+
+
+def _build_windows(sentences: list[str], window_size: int) -> list[str]:
+    """Build overlapping sentence windows for stable embeddings."""
+    half = window_size // 2
+    return [
+        " ".join(sentences[max(0, i - half) : min(len(sentences), i + half + 1)])
+        for i in range(len(sentences))
+    ]
+
+
+def _chunks_from_breakpoints(
+    sentences: list[str],
+    similarities: np.ndarray,
+    threshold: float,
+    min_size: int,
+    max_size: int,
+) -> list[str]:
+    """Given per-sentence similarities, cut at breakpoints and enforce sizes."""
+    breakpoints = [i + 1 for i, sim in enumerate(similarities) if sim < threshold]
+    chunks: list[str] = []
+    start = 0
+    for bp in breakpoints:
+        text = " ".join(sentences[start:bp]).strip()
+        if text:
+            chunks.append(text)
+        start = bp
+    if start < len(sentences):
+        text = " ".join(sentences[start:]).strip()
+        if text:
+            chunks.append(text)
+    return _enforce_chunk_sizes(chunks, min_size, max_size)
+
+
 def semantic_chunk(
     text: str,
     embeddings: OpenAIEmbeddings,
@@ -122,47 +175,17 @@ def semantic_chunk(
     if len(sentences) <= 1:
         return [text] if text.strip() else []
 
-    # Build sentence windows for more stable embeddings
-    windows = []
-    for i in range(len(sentences)):
-        start = max(0, i - window_size // 2)
-        end = min(len(sentences), i + window_size // 2 + 1)
-        windows.append(" ".join(sentences[start:end]))
+    windows = _build_windows(sentences, window_size)
+    emb_array = np.asarray(embeddings.embed_documents(windows))
+    similarities = _consecutive_cosine_sim(emb_array)
 
-    # Batch embed all windows
-    window_embeddings = embeddings.embed_documents(windows)
-    emb_array = np.array(window_embeddings)
-
-    # Compute similarities between consecutive windows
-    similarities = []
-    for i in range(len(emb_array) - 1):
-        sim = _cosine_similarity(emb_array[i], emb_array[i + 1])
-        similarities.append(sim)
-
-    # Find breakpoints where similarity drops below threshold
-    breakpoints = []
-    for i, sim in enumerate(similarities):
-        if sim < similarity_threshold:
-            breakpoints.append(i + 1)  # Split AFTER sentence i
-
-    # Build chunks from sentence groups between breakpoints
-    chunks = []
-    start = 0
-    for bp in breakpoints:
-        chunk_text = " ".join(sentences[start:bp]).strip()
-        if chunk_text:
-            chunks.append(chunk_text)
-        start = bp
-
-    # Don't forget the last segment
-    if start < len(sentences):
-        chunk_text = " ".join(sentences[start:]).strip()
-        if chunk_text:
-            chunks.append(chunk_text)
-
-    # Enforce size constraints: merge small chunks, split large ones
-    merged = _enforce_chunk_sizes(chunks, min_chunk_size, max_chunk_size)
-    return merged
+    return _chunks_from_breakpoints(
+        sentences,
+        similarities,
+        threshold=similarity_threshold,
+        min_size=min_chunk_size,
+        max_size=max_chunk_size,
+    )
 
 
 def _enforce_chunk_sizes(
@@ -221,18 +244,8 @@ Answer ONLY with the contextual summary, nothing else."""
 
 
 def _build_context_llm(settings: Settings) -> ChatOpenAI:
-    """Build the LLM for contextual retrieval generation."""
-    model = settings.chunking.context_model or settings.llm.model
-    kwargs = {
-        "model": model,
-        "temperature": 0,
-        "openai_api_key": settings.llm_api_key,
-        "max_retries": 5,
-        "request_timeout": 60,
-    }
-    if settings.llm_base_url:
-        kwargs["openai_api_base"] = settings.llm_base_url
-    return ChatOpenAI(**kwargs)
+    """Return the shared contextual-retrieval LLM client (cached)."""
+    return get_context_llm(settings)
 
 
 def generate_chunk_contexts(
@@ -240,11 +253,12 @@ def generate_chunk_contexts(
     document_text: str,
     settings: Settings,
 ) -> list[Document]:
-    """Add LLM-generated contextual summaries to each chunk.
+    """Add LLM-generated contextual summaries to each chunk, in parallel.
 
-    For each chunk, the LLM sees the full document excerpt + the chunk,
-    and generates a short context that situates the chunk within the document.
-    This context is prepended to the chunk content.
+    Each chunk requires an independent LLM call — the work is embarrassingly
+    parallel and I/O-bound, so a ThreadPoolExecutor with
+    settings.chunking.context_workers threads gives a near-linear speedup up to
+    the provider's rate limit.
     """
     llm = _build_context_llm(settings)
 
@@ -258,27 +272,30 @@ def generate_chunk_contexts(
     prompt = ChatPromptTemplate.from_messages([
         ("human", _CONTEXT_PROMPT),
     ])
-
     chain = prompt | llm
 
-    contextualized = []
-    for chunk in chunks:
+    def _contextualize_one(chunk: Document) -> Document:
         try:
             result = chain.invoke({
                 "document_excerpt": doc_excerpt,
                 "chunk_content": chunk.page_content,
             })
-            context = result.content.strip()
-            # Prepend context to chunk
-            chunk.page_content = f"<context>\n{context}\n</context>\n{chunk.page_content}"
+            chunk.page_content = (
+                f"<context>\n{result.content.strip()}\n</context>\n{chunk.page_content}"
+            )
             chunk.metadata["has_context"] = True
         except Exception as e:
-            # If context generation fails, keep the chunk as-is
             console.print(f"    [yellow]Context generation failed: {str(e)[:60]}[/yellow]")
             chunk.metadata["has_context"] = False
-        contextualized.append(chunk)
+        return chunk
 
-    return contextualized
+    workers = max(1, min(settings.chunking.context_workers, len(chunks)))
+    if workers == 1 or len(chunks) <= 1:
+        return [_contextualize_one(c) for c in chunks]
+
+    # executor.map preserves input order, so chunk ordering is stable
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_contextualize_one, chunks))
 
 
 # ---------------------------------------------------------------------------
@@ -286,9 +303,30 @@ def generate_chunk_contexts(
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _silence_c_stderr():
+    """Silence stderr at the file-descriptor level (C libs bypass sys.stderr).
+
+    PyMuPDF's bundled Tesseract/Leptonica write directly to fd 2 when they hit
+    tiny embedded images ("Image too small to scale", "Bad pix from ImageData",
+    etc.). Those messages are harmless but flood the console and break Rich's
+    progress bar. Python-level exceptions are unaffected.
+    """
+    saved = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(devnull)
+        os.close(saved)
+
+
 def parse_pdf(pdf_path: Path) -> list[dict]:
     """Parse a PDF into per-page Markdown chunks with metadata."""
-    pages = pymupdf4llm.to_markdown(str(pdf_path), page_chunks=True)
+    with _silence_c_stderr():
+        pages = pymupdf4llm.to_markdown(str(pdf_path), page_chunks=True)
     return pages
 
 
@@ -313,7 +351,7 @@ def build_chunks(
 
     # Extract title from first page
     first_text = pages[0].get("text", "") if pages else ""
-    title_lines = [l.strip() for l in first_text.split("\n") if l.strip()]
+    title_lines = [line.strip() for line in first_text.split("\n") if line.strip()]
     title = title_lines[0][:120] if title_lines else source_name
 
     if use_semantic:
@@ -387,24 +425,60 @@ def _build_chunks_semantic(
     settings: Settings,
     embeddings: OpenAIEmbeddings,
 ) -> list[Document]:
-    """Semantic chunking: splits at embedding similarity breakpoints."""
-    all_chunks = []
+    """Semantic chunking with a single cross-page embedding batch per document.
 
+    Collects the sentence windows of every page, embeds them in one
+    embed_documents() call, then slices the embedding array back per page to
+    compute breakpoints. This replaces N-per-page API round-trips with one.
+    """
+    max_size = settings.chunking.chunk_size + 500
+    min_size = max(100, settings.chunking.chunk_size // 5)
+    threshold = settings.chunking.similarity_threshold
+    window_size = 3
+
+    # Pass 1: tokenize sentences and build windows per page
+    page_specs: list[dict] = []  # one per non-empty page
+    all_windows: list[str] = []
     for page_data in pages:
         text = page_data.get("text", "")
         if not text.strip():
             continue
-
+        sentences = _split_sentences(text)
         page_meta = page_data.get("metadata", {})
         page_num = page_meta.get("page", 0) + 1
+        spec: dict = {
+            "sentences": sentences,
+            "page_num": page_num,
+            "text": text,
+            "window_start": len(all_windows),
+        }
+        if len(sentences) > 1:
+            windows = _build_windows(sentences, window_size)
+            all_windows.extend(windows)
+        spec["window_end"] = len(all_windows)
+        page_specs.append(spec)
 
-        chunk_texts = semantic_chunk(
-            text=text,
-            embeddings=embeddings,
-            similarity_threshold=settings.chunking.similarity_threshold,
-            max_chunk_size=settings.chunking.chunk_size + 500,  # Allow slightly larger semantic chunks
-            min_chunk_size=max(100, settings.chunking.chunk_size // 5),
-        )
+    # Pass 2: single batched embed call for the whole document
+    emb_array = (
+        np.asarray(embeddings.embed_documents(all_windows))
+        if all_windows
+        else np.empty((0, 0))
+    )
+
+    # Pass 3: per-page breakpoint + chunk build
+    all_chunks: list[Document] = []
+    for spec in page_specs:
+        sentences = spec["sentences"]
+        page_num = spec["page_num"]
+
+        if len(sentences) <= 1:
+            chunk_texts = [spec["text"]] if spec["text"].strip() else []
+        else:
+            page_embs = emb_array[spec["window_start"] : spec["window_end"]]
+            similarities = _consecutive_cosine_sim(page_embs)
+            chunk_texts = _chunks_from_breakpoints(
+                sentences, similarities, threshold, min_size, max_size,
+            )
 
         for chunk_text in chunk_texts:
             section = _extract_section_header(chunk_text)
@@ -460,10 +534,7 @@ def ingest_documents(settings: Settings, force: bool = False) -> dict:
         console.print(f"  Modelo de contexto: {ctx_model}")
 
     # Build embeddings (needed for both semantic chunking and ChromaDB)
-    embeddings = OpenAIEmbeddings(
-        model=settings.llm.embedding_model,
-        openai_api_key=settings.openai_api_key,
-    )
+    embeddings = get_embeddings(settings)
 
     # Deduplication: compute hashes and skip duplicates
     seen_hashes: dict[str, str] = {}
@@ -574,6 +645,7 @@ def ingest_documents(settings: Settings, force: bool = False) -> dict:
 
     bm25_full_path.parent.mkdir(parents=True, exist_ok=True)
     with open(bm25_full_path, "wb") as f:
+        f.write(_BM25_MAGIC)
         pickle.dump({"bm25": bm25, "documents": all_chunks}, f)
 
     chunking_mode = "semantic" if use_semantic else "fixed"

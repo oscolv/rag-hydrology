@@ -1,19 +1,16 @@
 """Tests for the ingestion pipeline."""
 
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 
-import pytest
 from langchain_core.documents import Document
 
-from rag.config import Settings, ChunkingConfig
+from rag.config import ChunkingConfig, Settings
 from rag.ingest import (
-    _file_hash,
-    _extract_year,
     _detect_language,
-    _extract_section_header,
-    _split_sentences,
     _enforce_chunk_sizes,
+    _extract_section_header,
+    _extract_year,
+    _split_sentences,
     build_chunks,
 )
 

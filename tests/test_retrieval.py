@@ -1,8 +1,7 @@
 """Tests for the retrieval pipeline."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 from langchain_core.documents import Document
 
 from rag.retrieval import HybridRetriever

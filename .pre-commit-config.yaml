@@ -1,0 +1,39 @@
+---
+# Pre-commit hooks for the RAG pipeline. Run `pre-commit install` once per
+# clone; thereafter `git commit` invokes the hooks on staged files.
+#
+# Covers three hardening phases: lint/format (ruff), secret scanning
+# (gitleaks), and generic hygiene (trailing whitespace, private keys,
+# oversized files). Dependency vulnerability scanning (pip-audit) runs in CI
+# instead — it's too slow for every commit.
+
+repos:
+  # --- Generic hygiene ---------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+
+  # --- Python lint + format (ruff replaces flake8/isort/black) ----------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.0
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # --- Secret scanning ---------------------------------------------------
+  # Blocks commits that contain API keys, bearer tokens, or .env values.
+  # Rules inherit gitleaks' default set plus the customizations in
+  # .gitleaks.toml at the repo root.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.0
+    hooks:
+      - id: gitleaks

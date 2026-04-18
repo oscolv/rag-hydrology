@@ -5,6 +5,7 @@ chunking:
   similarity_threshold: 0.82
   contextual_retrieval: true
   context_model: null  # Uses llm.model if null
+  context_workers: 8   # Parallel threads for contextual retrieval LLM calls
 retrieval:
   dense_k: 20
   bm25_k: 20

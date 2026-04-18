@@ -1,0 +1,53 @@
+/* Minimal extras on top of Tailwind — mostly typography inside streamed
+ * answers so the prose plugin renders citations and code cleanly. */
+
+html, body { height: 100%; }
+
+.citation {
+  display: inline-block;
+  padding: 0 4px;
+  margin: 0 1px;
+  border-radius: 4px;
+  background: #eef2ff;
+  color: #4338ca;
+  font-size: 0.80em;
+  font-weight: 600;
+  text-decoration: none;
+  vertical-align: text-bottom;
+}
+.citation:hover {
+  background: #c7d2fe;
+  color: #3730a3;
+}
+
+.prose :where(p):not(:where([class~="not-prose"] *)) {
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+.prose :where(pre) {
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem;
+  font-size: 0.8rem;
+}
+
+.prose :where(code):not(:where([class~="not-prose"] *))::before,
+.prose :where(code):not(:where([class~="not-prose"] *))::after {
+  content: "";
+}
+.prose :where(code):not(:where([class~="not-prose"] *)) {
+  background: #f1f5f9;
+  color: #0f172a;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+/* Smooth cursor hint on the target source card when clicked */
+@keyframes flash-ring {
+  0%   { box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.45); }
+  100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
+}
+details:target { animation: flash-ring 1.4s ease-out 1; }

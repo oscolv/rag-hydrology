@@ -1,29 +1,30 @@
 """Evaluation pipeline using RAGAS metrics with rate-limit handling."""
 
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import pandas as pd
 from datasets import Dataset
 from langchain_chroma import Chroma
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
 from ragas import evaluate
-from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.llms import LangchainLLMWrapper
 from ragas.metrics import (
     Faithfulness,
-    ResponseRelevancy,
     LLMContextPrecisionWithoutReference,
     LLMContextRecall,
+    ResponseRelevancy,
 )
 from ragas.run_config import RunConfig
 from ragas.testset import TestsetGenerator
+from rich import box
 from rich.console import Console
 from rich.table import Table
-from rich import box
 
 from rag.config import Settings
+from rag.factories import get_embeddings
 
 console = Console()
 
@@ -48,10 +49,7 @@ def _build_eval_llm(settings: Settings) -> ChatOpenAI:
 
 def load_documents_from_chroma(settings: Settings) -> list:
     """Load all documents from ChromaDB for test set generation."""
-    embeddings = OpenAIEmbeddings(
-        model=settings.llm.embedding_model,
-        openai_api_key=settings.openai_api_key,
-    )
+    embeddings = get_embeddings(settings)
     vectorstore = Chroma(
         persist_directory=str(settings.chroma_path),
         embedding_function=embeddings,
@@ -61,7 +59,7 @@ def load_documents_from_chroma(settings: Settings) -> list:
     from langchain_core.documents import Document
 
     docs = []
-    for text, meta in zip(results["documents"], results["metadatas"]):
+    for text, meta in zip(results["documents"], results["metadatas"], strict=False):
         docs.append(Document(page_content=text, metadata=meta))
     return docs
 
@@ -72,14 +70,11 @@ def generate_testset(settings: Settings, output_path: Path | None = None, testse
     Always uses gpt-4o-mini (OpenAI) for generation — RAGAS requires strict
     JSON parsing that is only reliable with OpenAI models.
     """
-    console.print(f"[bold]Generando test set sintetico...[/bold]")
+    console.print("[bold]Generando test set sintetico...[/bold]")
     console.print(f"  Modelo RAGAS: [cyan]{settings.evaluation.eval_model}[/cyan] (OpenAI)")
 
     llm = LangchainLLMWrapper(_build_eval_llm(settings))
-    embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(
-        model=settings.llm.embedding_model,
-        openai_api_key=settings.openai_api_key,
-    ))
+    embeddings = LangchainEmbeddingsWrapper(get_embeddings(settings))
 
     generator = TestsetGenerator(llm=llm, embedding_model=embeddings)
 
@@ -91,7 +86,8 @@ def generate_testset(settings: Settings, output_path: Path | None = None, testse
     if len(docs) > max_docs:
         import random
         random.seed(42)
-        docs = random.sample(docs, max_docs)
+        # Reproducible sampling for evaluation — not a security-sensitive use.
+        docs = random.sample(docs, max_docs)  # nosec B311
         console.print(f"  Usando muestra de {max_docs} chunks para generacion")
 
     test_size = testset_size or settings.evaluation.test_set_size
@@ -167,7 +163,7 @@ def run_evaluation(
         except Exception as e:
             error_msg = str(e)
             if "429" in error_msg or "rate_limit" in error_msg.lower():
-                console.print(f"    [yellow]Rate limit, esperando 30s...[/yellow]")
+                console.print("    [yellow]Rate limit, esperando 30s...[/yellow]")
                 time.sleep(30)
                 # Retry once
                 try:
@@ -181,8 +177,10 @@ def run_evaluation(
                         "reference": row.get("reference_answer", row.get("reference", "")),
                     })
                     continue
-                except Exception:
-                    pass
+                except Exception as retry_err:
+                    console.print(
+                        f"    [red]Retry failed: {str(retry_err)[:80]}[/red]"
+                    )
 
             console.print(f"    [red]Error: {error_msg[:80]}[/red]")
             errors += 1
@@ -210,13 +208,10 @@ def run_evaluation(
     ]
 
     eval_llm = LangchainLLMWrapper(_build_eval_llm(settings))
-    eval_embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(
-        model=settings.llm.embedding_model,
-        openai_api_key=settings.openai_api_key,
-    ))
+    eval_embeddings = LangchainEmbeddingsWrapper(get_embeddings(settings))
 
     console.print("\n[bold]Calculando metricas RAGAS...[/bold]")
-    console.print(f"  [dim]Esto puede tardar varios minutos con rate limiting[/dim]")
+    console.print("  [dim]Esto puede tardar varios minutos con rate limiting[/dim]")
 
     run_cfg = RunConfig(max_workers=4, max_retries=15, max_wait=90, timeout=300)
 

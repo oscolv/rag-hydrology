@@ -44,15 +44,29 @@ Dense    Sparse
 
 ### Sistema
 
+Tesseract OCR (necesario para PDFs escaneados):
+
 ```bash
 sudo apt install tesseract-ocr tesseract-ocr-eng tesseract-ocr-spa
 ```
 
 ### Python >= 3.11
 
+Instalacion editable con dependencias de desarrollo:
+
 ```bash
 pip install -e ".[dev]"
 ```
+
+Esto instala todo lo necesario:
+
+- **LangChain** (`langchain`, `langchain-openai`, `langchain-chroma`, `langchain-cohere`) — orquestacion del pipeline RAG
+- **PDF parsing** (`pymupdf`, `pymupdf4llm`) — extraccion de texto con preservacion de estructura
+- **Retrieval** (`rank-bm25`) — indice sparse BM25
+- **Evaluacion** (`ragas`, `datasets`) — metricas automatizadas
+- **Servidor web** (`fastapi`, `uvicorn[standard]`) — API REST + SSE streaming + UI web
+- **CLI** (`typer`, `rich`, `prompt_toolkit`) — interfaz de linea de comandos interactiva
+- **Dev** (`pytest`, `ruff`, `bandit`, `pip-audit`, `pre-commit`) — tests y seguridad
 
 ### API Keys
 
@@ -65,6 +79,16 @@ COHERE_API_KEY=...
 
 - **OpenAI**: Embeddings (`text-embedding-3-small`) y generacion (`gpt-4o`)
 - **Cohere**: Reranker (`rerank-v3.5`). Tier gratuito: 1000 llamadas/mes
+
+### Docker (alternativa)
+
+En lugar de instalacion local, puedes usar Docker:
+
+```bash
+docker compose up
+```
+
+El `docker-compose.yml` incluye el servidor FastAPI + UI web en el puerto 8765.
 
 ## Comandos
 

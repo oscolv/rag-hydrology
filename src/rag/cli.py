@@ -2,22 +2,20 @@
 
 import json
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import ClassVar
 
 import typer
+from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.table import Table
 from rich.rule import Rule
-from rich.columns import Columns
-from rich.text import Text
-from rich import box
+from rich.table import Table
 
-from rag.config import get_settings, Settings
+from rag.collections import CollectionManager, valid_collection_name
+from rag.config import Settings, get_settings
 
 console = Console()
 
@@ -136,8 +134,21 @@ app = typer.Typer(
 )
 docs_app = typer.Typer(help="Gestionar documentos PDF")
 config_app = typer.Typer(help="Ver y modificar configuracion")
+collection_app = typer.Typer(help="Gestionar colecciones (corpus independientes)")
 app.add_typer(docs_app, name="docs")
 app.add_typer(config_app, name="config")
+app.add_typer(collection_app, name="collection")
+
+
+def _apply_collection(collection: str | None) -> None:
+    """Set RAG_COLLECTION env var so get_settings() picks it up.
+
+    Must be called BEFORE any call to get_settings() in the command body,
+    since settings are lru_cached by project_root only.
+    """
+    if collection:
+        os.environ["RAG_COLLECTION"] = collection
+        get_settings.cache_clear()
 
 
 # ============================================================================
@@ -211,7 +222,7 @@ def status(
         _print_next_steps(settings)
     else:
         console.print("[bold green]El sistema esta listo para consultas.[/bold green]")
-        console.print(f"\n  Prueba: [bold cyan]rag chat[/bold cyan]")
+        console.print("\n  Prueba: [bold cyan]rag chat[/bold cyan]")
 
 
 def _print_check(label: str, ok: bool, hint: str | None = None) -> None:
@@ -253,6 +264,7 @@ def _print_next_steps(settings: Settings) -> None:
 def ingest(
     docs_dir: str = typer.Option(None, help="Directorio alternativo de PDFs"),
     force: bool = typer.Option(False, "--force", "-f", help="Re-indexar todo desde cero"),
+    collection: str = typer.Option(None, "--collection", "-c", help="Coleccion (default: activa)"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
     """Indexar PDFs: parsear, dividir en chunks, crear embeddings y construir indices.
@@ -276,9 +288,11 @@ def ingest(
     Ejemplos:
       rag ingest                Indexar nuevos PDFs
       rag ingest --force        Re-indexar todo desde cero
+      rag ingest -c papers      Indexar en la coleccion 'papers'
       rag config set chunking.semantic true     Activar semantic chunking
       rag config set chunking.contextual_retrieval true  Activar contextual retrieval
     """
+    _apply_collection(collection)
     settings = get_settings(project_root)
     if docs_dir:
         settings.docs_dir = docs_dir
@@ -314,6 +328,8 @@ def ingest(
 def query(
     question: str = typer.Argument(help="Pregunta a realizar"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Mostrar fuentes con preview"),
+    stream: bool = typer.Option(True, "--stream/--no-stream", help="Streaming de tokens"),
+    collection: str = typer.Option(None, "--collection", "-c", help="Coleccion (default: activa)"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
     """Hacer una consulta rapida contra los documentos indexados.
@@ -328,22 +344,29 @@ def query(
       rag query "What is GRACE?"
       rag query "Que contiene el atlas del agua?" -v
       rag query "TWS estimation methods" --verbose
+      rag query "..." --collection papers --no-stream
     """
+    _apply_collection(collection)
     settings = get_settings(project_root)
     if not _require_ready(settings):
         raise typer.Exit(1)
 
     from rag.retrieval import build_retriever
-    from rag.generation import build_rag_chain_with_sources
 
     with console.status("[bold]Cargando pipeline...[/bold]"):
         retriever = build_retriever(settings)
+
+    if stream:
+        result = _run_streaming_query(retriever, settings, question)
+    else:
+        from rag.generation import build_rag_chain_with_sources
         chain = build_rag_chain_with_sources(retriever, settings)
+        with console.status("[bold]Buscando y generando respuesta...[/bold]"):
+            result = chain(question)
+        _display_answer(result, verbose=verbose)
 
-    with console.status("[bold]Buscando y generando respuesta...[/bold]"):
-        result = chain(question)
-
-    _display_answer(result, verbose=verbose)
+    if verbose and result.get("source_documents"):
+        _display_sources(result["source_documents"], detailed=True)
 
     console.print("\n[dim]Tip: Usa [cyan]rag chat[/cyan] para una sesion interactiva con historial.[/dim]")
 
@@ -355,6 +378,8 @@ def query(
 @app.command()
 def chat(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Mostrar fuentes siempre"),
+    stream: bool = typer.Option(True, "--stream/--no-stream", help="Streaming de tokens"),
+    collection: str = typer.Option(None, "--collection", "-c", help="Coleccion (default: activa)"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
     """Iniciar sesion interactiva de consulta con tus documentos.
@@ -381,12 +406,13 @@ def chat(
       /help        Ver todos los comandos
       /quit        Salir
     """
+    _apply_collection(collection)
     settings = get_settings(project_root)
     if not _require_ready(settings):
         raise typer.Exit(1)
 
-    from rag.retrieval import build_retriever
     from rag.generation import build_rag_chain_with_sources
+    from rag.retrieval import build_retriever
 
     # Welcome
     console.print(LOGO)
@@ -439,7 +465,7 @@ def chat(
 
     with console.status("[bold]Cargando pipeline (esto puede tardar unos segundos)...[/bold]"):
         retriever = build_retriever(settings)
-        chain = build_rag_chain_with_sources(retriever, settings)
+        chain = None if stream else build_rag_chain_with_sources(retriever, settings)
 
     console.print("[green]Listo.[/green] Escribe tu primera pregunta.\n")
 
@@ -526,13 +552,16 @@ def chat(
 
         # Run query
         query_count += 1
-        with console.status("[bold]Buscando en los documentos y generando respuesta...[/bold]"):
-            try:
-                result = chain(question)
-            except Exception as e:
-                console.print(f"\n[bold red]Error al procesar la consulta:[/bold red] {e}")
-                console.print("[dim]Intenta reformular tu pregunta o verifica tu conexion.[/dim]")
-                continue
+        try:
+            if stream:
+                result = _run_streaming_query(retriever, settings, question)
+            else:
+                with console.status("[bold]Buscando en los documentos y generando respuesta...[/bold]"):
+                    result = chain(question)
+        except Exception as e:
+            console.print(f"\n[bold red]Error al procesar la consulta:[/bold red] {e}")
+            console.print("[dim]Intenta reformular tu pregunta o verifica tu conexion.[/dim]")
+            continue
 
         last_result = result
         history.append({
@@ -545,7 +574,10 @@ def chat(
             ],
         })
 
-        _display_answer(result, verbose=show_sources)
+        if not stream:
+            _display_answer(result, verbose=show_sources)
+        elif show_sources:
+            _display_sources(result.get("source_documents", []), detailed=True)
 
         # Show Self-RAG reflection summary in verbose mode
         if show_sources and result.get("reflection"):
@@ -568,6 +600,7 @@ def chat(
 def search(
     query_text: str = typer.Argument(help="Texto de busqueda"),
     top_k: int = typer.Option(5, "--top-k", "-k", help="Numero de resultados"),
+    collection: str = typer.Option(None, "--collection", "-c", help="Coleccion (default: activa)"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
     """Buscar documentos sin usar el LLM (solo retrieval).
@@ -578,6 +611,7 @@ def search(
       - Depurar problemas de relevancia
       - Buscar fragmentos especificos sin generar respuesta
     """
+    _apply_collection(collection)
     settings = get_settings(project_root)
     if not _require_ready(settings):
         raise typer.Exit(1)
@@ -638,6 +672,7 @@ def export(
     query_text: str = typer.Argument(help="Pregunta a realizar"),
     output: str = typer.Option(None, "--output", "-o", help="Ruta del archivo de salida"),
     format: str = typer.Option("markdown", "--format", "-f", help="Formato: markdown o json"),
+    collection: str = typer.Option(None, "--collection", "-c", help="Coleccion (default: activa)"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
     """Consultar y exportar la respuesta con fuentes a un archivo.
@@ -652,12 +687,13 @@ def export(
       rag export "Explain GRACE-FO" -o report.md
       rag export "TWS methods" -f json -o results.json
     """
+    _apply_collection(collection)
     settings = get_settings(project_root)
     if not _require_ready(settings):
         raise typer.Exit(1)
 
-    from rag.retrieval import build_retriever
     from rag.generation import build_rag_chain_with_sources
+    from rag.retrieval import build_retriever
 
     with console.status("[bold]Cargando pipeline...[/bold]"):
         retriever = build_retriever(settings)
@@ -724,6 +760,7 @@ def evaluate_cmd(
     generate: bool = typer.Option(False, "--generate", "-g", help="Generar test set sintetico primero"),
     size: int = typer.Option(None, "--size", "-s", help="Numero de preguntas a generar (default: config.yaml)"),
     testset: str = typer.Option(None, help="Ruta a un test set CSV existente"),
+    collection: str = typer.Option(None, "--collection", "-c", help="Coleccion (default: activa)"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
     """Evaluar la calidad del sistema RAG con metricas RAGAS.
@@ -755,13 +792,14 @@ def evaluate_cmd(
       rag config set retrieval.self_rag true
       rag evaluate                         # Con Self-RAG (mismo test set)
     """
+    _apply_collection(collection)
     settings = get_settings(project_root)
     if not _require_ready(settings):
         raise typer.Exit(1)
 
     from rag.evaluation import generate_testset, run_evaluation
-    from rag.retrieval import build_retriever
     from rag.generation import build_rag_chain_with_sources
+    from rag.retrieval import build_retriever
 
     testset_path = Path(testset) if testset else None
 
@@ -787,9 +825,11 @@ def evaluate_cmd(
 
 @app.command()
 def info(
+    collection: str = typer.Option(None, "--collection", "-c", help="Coleccion (default: activa)"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
     """Ver estadisticas del indice, inventario de documentos y configuracion."""
+    _apply_collection(collection)
     settings = get_settings(project_root)
 
     chroma_path = settings.chroma_path
@@ -887,9 +927,11 @@ def info(
 
 @docs_app.command("list")
 def docs_list(
+    collection: str = typer.Option(None, "--collection", "-c", help="Coleccion (default: activa)"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
     """Listar PDFs y su estado de indexacion."""
+    _apply_collection(collection)
     settings = get_settings(project_root)
     docs_path = settings.docs_path
     pdf_files = sorted(docs_path.glob("*.pdf"))
@@ -953,6 +995,7 @@ def docs_list(
 @docs_app.command("add")
 def docs_add(
     paths: list[str] = typer.Argument(help="Rutas de archivos PDF a agregar"),
+    collection: str = typer.Option(None, "--collection", "-c", help="Coleccion (default: activa)"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
     """Agregar archivos PDF al directorio de documentos.
@@ -962,6 +1005,7 @@ def docs_add(
       rag docs add paper1.pdf paper2.pdf ~/downloads/estudio.pdf
     """
     import shutil
+    _apply_collection(collection)
     settings = get_settings(project_root)
     docs_path = settings.docs_path
     docs_path.mkdir(parents=True, exist_ok=True)
@@ -998,6 +1042,7 @@ def docs_add(
 def docs_remove(
     names: list[str] = typer.Argument(help="Nombres de PDFs a eliminar"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Confirmar sin preguntar"),
+    collection: str = typer.Option(None, "--collection", "-c", help="Coleccion (default: activa)"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
     """Eliminar PDFs del directorio y purgar del indice.
@@ -1007,6 +1052,7 @@ def docs_remove(
       rag docs remove paper_viejo.pdf
       rag docs remove archivo1.pdf archivo2.pdf --yes
     """
+    _apply_collection(collection)
     settings = get_settings(project_root)
 
     if not yes:
@@ -1096,8 +1142,8 @@ def config_show(
         or_ok = "[green]configurada[/green]" if settings.openrouter_api_key else "[red]falta[/red]"
         console.print(f"  OPENROUTER_API_KEY: {or_ok}")
 
-    console.print(f"\n[dim]Modificar: rag config set seccion.parametro valor[/dim]")
-    console.print(f"[dim]Ejemplo:   rag config set llm.model gpt-4o-mini[/dim]")
+    console.print("\n[dim]Modificar: rag config set seccion.parametro valor[/dim]")
+    console.print("[dim]Ejemplo:   rag config set llm.model gpt-4o-mini[/dim]")
 
 
 @config_app.command("set")
@@ -1205,6 +1251,96 @@ def config_set(
 # ============================================================================
 # Display helpers
 # ============================================================================
+
+def _run_streaming_query(retriever, settings: Settings, question: str) -> dict:
+    """Stream tokens into a live-updating Rich panel. Return a result dict.
+
+    Mirrors the shape of build_rag_chain_with_sources output so downstream
+    display/export helpers don't need to care about streaming.
+    """
+    from rich.live import Live
+    from rich.markdown import Markdown
+
+    from rag.generation import build_rag_chain_streaming
+
+    chain = build_rag_chain_streaming(retriever, settings)
+
+    answer_buffer = ""
+    sources: list = []
+    reflection: list[dict] = []
+    question_final = question
+    request_id = ""
+
+    with Live(
+        Panel("[dim]Buscando en el indice...[/dim]", title="Respuesta", border_style="green"),
+        console=console,
+        refresh_per_second=20,
+        transient=False,
+    ) as live:
+        try:
+            for event in chain(question):
+                kind = event.get("event")
+                if kind == "retrieval_start":
+                    request_id = event.get("request_id", "")
+                elif kind == "sources":
+                    sources = event.get("documents", [])
+                    live.update(Panel(
+                        f"[dim]Generando respuesta ({len(sources)} fuentes)...[/dim]",
+                        title="Respuesta", border_style="green",
+                    ))
+                elif kind == "reflection":
+                    reflection.append(event.get("step", {}))
+                elif kind == "token":
+                    answer_buffer += event.get("content", "")
+                    live.update(Panel(
+                        Markdown(answer_buffer) if answer_buffer else "",
+                        title="Respuesta",
+                        border_style="green",
+                        padding=(1, 2),
+                    ))
+                elif kind == "regenerating":
+                    answer_buffer = ""  # reset for regenerated answer
+                    live.update(Panel(
+                        "[yellow]Regenerando (hallucination detectada)...[/yellow]",
+                        title="Respuesta", border_style="yellow",
+                    ))
+                elif kind == "done":
+                    answer_buffer = event.get("answer", answer_buffer)
+                    sources = event.get("source_documents", sources)
+                    if event.get("reflection"):
+                        reflection = event["reflection"]
+                    question_final = event.get("question", question)
+                elif kind == "error":
+                    live.update(Panel(
+                        f"[red]{event.get('message', 'error')}[/red]",
+                        title="Error", border_style="red",
+                    ))
+                    return {"answer": "", "source_documents": [], "question": question}
+        except KeyboardInterrupt:
+            live.update(Panel(
+                answer_buffer + "\n\n[dim][cancelado][/dim]",
+                title="Respuesta", border_style="yellow",
+            ))
+
+    # Compact source line below the live panel
+    if sources:
+        seen: list[str] = []
+        for d in sources:
+            s = d.metadata.get("source", "?")
+            p = d.metadata.get("page", "?")
+            tag = f"{s} p.{p}"
+            if tag not in seen:
+                seen.append(tag)
+        console.print(f"  [dim]Fuentes: {' | '.join(seen)}[/dim]")
+
+    return {
+        "answer": answer_buffer,
+        "source_documents": sources,
+        "question": question_final,
+        "request_id": request_id,
+        "reflection": reflection,
+    }
+
 
 def _display_answer(result: dict, verbose: bool = False) -> None:
     console.print()
@@ -1358,7 +1494,7 @@ def _build_chat_prompt():
     })
 
     class SlashCompleter(Completer):
-        commands = [
+        commands: ClassVar[list[tuple[str, str]]] = [
             ("/sources", "Ver fuentes de la ultima respuesta"),
             ("/s", "Atajo de /sources"),
             ("/history", "Ver historial de la conversacion"),
@@ -1480,6 +1616,492 @@ def _chat_quick_info(settings: Settings) -> None:
         active.append("Self-RAG")
     if active:
         console.print(f"  [cyan]Tecnicas:[/cyan]   {', '.join(active)}")
+
+
+# ============================================================================
+# rag collection list|create|switch|delete|info
+# ============================================================================
+
+
+@collection_app.command("list")
+def collection_list(
+    project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
+) -> None:
+    """Listar todas las colecciones disponibles."""
+    settings = get_settings(project_root)
+    mgr = CollectionManager(settings)
+    infos = mgr.list()
+
+    if not infos:
+        console.print("[yellow]No hay colecciones.[/yellow]")
+        console.print("Crea una con: [cyan]rag collection create <nombre>[/cyan]")
+        return
+
+    table = Table(title="Colecciones", show_edge=False, box=box.SIMPLE)
+    table.add_column("Activa", justify="center")
+    table.add_column("Nombre", style="cyan")
+    table.add_column("Display", style="white")
+    table.add_column("PDFs", style="green", justify="right")
+    table.add_column("Indice", justify="center")
+    table.add_column("Creada", style="dim")
+
+    for c in infos:
+        active_mark = "[bold green]*[/bold green]" if c.is_active else ""
+        name = c.name + (" [dim](legacy)[/dim]" if c.is_legacy else "")
+        idx = "[green]si[/green]" if c.has_index else "[red]no[/red]"
+        created = c.created_at[:10] if c.created_at else "-"
+        table.add_row(active_mark, name, c.display_name, str(c.pdf_count), idx, created)
+
+    console.print(table)
+    console.print(f"\n  [dim]Activa: {mgr.get_active()}[/dim]")
+    console.print("  [dim]Cambiar: rag collection switch <nombre>[/dim]")
+
+
+@collection_app.command("create")
+def collection_create(
+    name: str = typer.Argument(help="Nombre corto (letras, digitos, _, -)"),
+    display: str = typer.Option(None, "--display", help="Nombre amigable"),
+    description: str = typer.Option("", "--description", "-d", help="Descripcion"),
+    activate: bool = typer.Option(
+        True, "--activate/--no-activate", help="Activar la coleccion tras crearla",
+    ),
+    project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
+) -> None:
+    """Crear una nueva coleccion."""
+    if not valid_collection_name(name):
+        console.print("[red]Nombre invalido.[/red] Usa letras, digitos, _ o -.")
+        raise typer.Exit(1)
+
+    settings = get_settings(project_root)
+    mgr = CollectionManager(settings)
+
+    try:
+        info = mgr.create(name, display_name=display, description=description)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+    console.print(f"\n  [bold green]+[/bold green] Coleccion creada: [cyan]{info.name}[/cyan]")
+    console.print(f"    Carpeta: [dim]{info.path}[/dim]")
+
+    if activate:
+        mgr.set_active(name)
+        console.print("    [green]Activada.[/green]")
+
+    console.print("\n[bold]Siguiente paso:[/bold]")
+    console.print(f"  1. Copia PDFs a [cyan]{info.path / 'docs'}[/cyan]")
+    console.print(f"     o usa: [cyan]rag docs add archivo.pdf --collection {name}[/cyan]")
+    console.print(f"  2. Indexa:   [cyan]rag ingest --collection {name}[/cyan]")
+
+
+@collection_app.command("switch")
+def collection_switch(
+    name: str = typer.Argument(help="Nombre de la coleccion a activar"),
+    project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
+) -> None:
+    """Cambiar la coleccion activa."""
+    settings = get_settings(project_root)
+    mgr = CollectionManager(settings)
+    if not mgr.exists(name):
+        console.print(f"[red]Coleccion '{name}' no existe.[/red]")
+        console.print("Disponibles: " + ", ".join(c.name for c in mgr.list()))
+        raise typer.Exit(1)
+
+    mgr.set_active(name)
+    console.print(f"[green]Coleccion activa: [cyan]{name}[/cyan][/green]")
+
+
+@collection_app.command("delete")
+def collection_delete(
+    name: str = typer.Argument(help="Nombre de la coleccion a eliminar"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirmar sin preguntar"),
+    project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
+) -> None:
+    """Eliminar una coleccion (borra PDFs, indices y metadata)."""
+    settings = get_settings(project_root)
+    mgr = CollectionManager(settings)
+
+    if not mgr.exists(name):
+        console.print(f"[red]Coleccion '{name}' no existe.[/red]")
+        raise typer.Exit(1)
+
+    if not yes:
+        info = mgr.get(name)
+        console.print(
+            f"[yellow]Se eliminara la coleccion '{name}' "
+            f"({info.pdf_count} PDFs, indice: {'si' if info.has_index else 'no'}).[/yellow]"
+        )
+        if not typer.confirm("Continuar?"):
+            console.print("[dim]Cancelado.[/dim]")
+            return
+
+    try:
+        mgr.delete(name)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+    console.print(f"[green]Coleccion eliminada: {name}[/green]")
+
+
+@collection_app.command("info")
+def collection_info(
+    name: str = typer.Argument(None, help="Coleccion (default: activa)"),
+    project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
+) -> None:
+    """Ver informacion detallada de una coleccion."""
+    settings = get_settings(project_root)
+    mgr = CollectionManager(settings)
+    target = name or mgr.get_active()
+
+    if not mgr.exists(target):
+        console.print(f"[red]Coleccion '{target}' no existe.[/red]")
+        raise typer.Exit(1)
+
+    info = mgr.get(target)
+    table = Table(show_edge=False, box=box.SIMPLE)
+    table.add_column("", style="cyan")
+    table.add_column("", style="white")
+    table.add_row("Nombre", info.name)
+    table.add_row("Display", info.display_name)
+    table.add_row("Descripcion", info.description or "(sin descripcion)")
+    table.add_row("Activa", "Si" if info.is_active else "No")
+    table.add_row("Legacy", "Si" if info.is_legacy else "No")
+    table.add_row("Ruta", str(info.path))
+    table.add_row("PDFs", str(info.pdf_count))
+    table.add_row("Indice completo", "Si" if info.has_index else "No")
+    table.add_row("Creada", info.created_at or "-")
+    console.print(table)
+
+
+# ============================================================================
+# rag init (onboarding wizard)
+# ============================================================================
+
+
+@app.command()
+def init(
+    project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
+    force: bool = typer.Option(False, "--force", help="Sobreescribir config existente"),
+) -> None:
+    """Asistente interactivo de configuracion inicial.
+
+    \b
+    Verifica dependencias, solicita las API keys, crea config.yaml y .env,
+    y prepara la primera coleccion. Ejecuta esto la primera vez que usas el
+    sistema en un proyecto.
+    """
+    from rich.prompt import Confirm, Prompt
+
+    root = Path(project_root).resolve()
+    console.print(LOGO)
+    console.print(Panel(
+        "[bold]Bienvenido[/bold]\n\n"
+        "Este asistente configurara tu RAG en 1 minuto.\n"
+        "Puedes cancelar en cualquier momento con [cyan]Ctrl+C[/cyan] "
+        "y volver a ejecutar [cyan]rag init[/cyan].",
+        border_style="blue",
+        padding=(1, 2),
+    ))
+
+    config_file = root / "config.yaml"
+    env_file = root / ".env"
+
+    # --- Tesseract dep check ---
+    import shutil as _shutil
+    tess = _shutil.which("tesseract")
+    if not tess:
+        console.print("\n[yellow]![/yellow] Tesseract OCR no encontrado.")
+        console.print("  [dim]Instalalo con: sudo apt install tesseract-ocr tesseract-ocr-eng tesseract-ocr-spa[/dim]")
+        console.print("  [dim](No bloquea la configuracion — pero OCR de PDFs escaneados no funcionara.)[/dim]")
+    else:
+        console.print(f"\n[green]✓[/green] Tesseract: [dim]{tess}[/dim]")
+
+    # --- Existing config detection ---
+    overwrite_config = force
+    if config_file.exists() and not force:
+        console.print(f"\n[yellow]!Existe {config_file}[/yellow]")
+        overwrite_config = Confirm.ask("  Sobreescribir config.yaml?", default=False)
+    overwrite_env = force
+    if env_file.exists() and not force:
+        console.print(f"[yellow]!Existe {env_file}[/yellow]")
+        overwrite_env = Confirm.ask("  Sobreescribir .env?", default=False)
+
+    # --- Domain & collection ---
+    console.print("\n[bold]Dominio del corpus[/bold]")
+    domain_name = Prompt.ask(
+        "  Nombre del dominio",
+        default="Documents",
+    )
+    collection_slug = _slugify(domain_name) or "rag_docs"
+    collection_slug = Prompt.ask(
+        "  Nombre de la coleccion (ChromaDB)",
+        default=collection_slug,
+    )
+    grader_description = Prompt.ask(
+        "  Descripcion para el grader Self-RAG",
+        default=f"a {domain_name.lower()} research RAG system",
+    )
+
+    # --- Example queries ---
+    console.print("\n[bold]Preguntas de ejemplo[/bold] [dim](vacio para terminar)[/dim]")
+    examples: list[str] = []
+    for i in range(1, 6):
+        q = Prompt.ask(f"  Ejemplo {i}", default="")
+        if not q:
+            break
+        examples.append(q)
+    if not examples:
+        examples = [
+            "What are the main findings of these documents?",
+            "Summarize the key methodology used.",
+        ]
+
+    # --- API keys ---
+    console.print("\n[bold]API Keys[/bold]")
+    api_keys: dict[str, str] = {}
+    openai_key = Prompt.ask(
+        "  OPENAI_API_KEY [dim](requerida)[/dim]",
+        default="", password=True, show_default=False,
+    )
+    if openai_key:
+        api_keys["OPENAI_API_KEY"] = openai_key
+    cohere_key = Prompt.ask(
+        "  COHERE_API_KEY [dim](para reranking)[/dim]",
+        default="", password=True, show_default=False,
+    )
+    if cohere_key:
+        api_keys["COHERE_API_KEY"] = cohere_key
+    openrouter_key = Prompt.ask(
+        "  OPENROUTER_API_KEY [dim](opcional, si usas OpenRouter)[/dim]",
+        default="", password=True, show_default=False,
+    )
+    if openrouter_key:
+        api_keys["OPENROUTER_API_KEY"] = openrouter_key
+
+    # --- LLM model ---
+    console.print("\n[bold]Modelo[/bold]")
+    use_openrouter = bool(openrouter_key) and Confirm.ask(
+        "  Usar OpenRouter para la generacion?", default=True,
+    )
+    if use_openrouter:
+        llm_model = Prompt.ask("  Modelo", default="anthropic/claude-sonnet-4")
+        llm_base_url = "https://openrouter.ai/api/v1"
+    else:
+        llm_model = Prompt.ask("  Modelo", default="gpt-4o-mini")
+        llm_base_url = None
+
+    # --- Write config.yaml ---
+    if overwrite_config or not config_file.exists():
+        import yaml as _yaml
+        config_data = {
+            "chunking": {
+                "chunk_size": 1000,
+                "chunk_overlap": 200,
+                "semantic": False,
+                "similarity_threshold": 0.82,
+                "contextual_retrieval": False,
+                "context_workers": 8,
+            },
+            "retrieval": {
+                "dense_k": 20,
+                "bm25_k": 20,
+                "rerank_top_k": 5,
+                "multi_query": True,
+                "self_rag": False,
+                "self_rag_max_retries": 2,
+            },
+            "llm": {
+                "model": llm_model,
+                "temperature": 0.1,
+                "embedding_model": "text-embedding-3-small",
+                "base_url": llm_base_url,
+            },
+            "evaluation": {
+                "test_set_size": 30,
+                "eval_model": "gpt-4o-mini",
+            },
+            "domain": {
+                "name": domain_name,
+                "collection_name": collection_slug,
+                "grader_description": grader_description,
+                "example_queries": examples,
+            },
+        }
+        with open(config_file, "w") as f:
+            _yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
+        console.print("\n[green]✓[/green] config.yaml creado")
+
+    # --- Write .env ---
+    if api_keys and (overwrite_env or not env_file.exists()):
+        existing: dict[str, str] = {}
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if "=" in line and not line.strip().startswith("#"):
+                    k, _, v = line.partition("=")
+                    existing[k.strip()] = v.strip()
+        existing.update(api_keys)
+        with open(env_file, "w") as f:
+            for k, v in existing.items():
+                f.write(f"{k}={v}\n")
+        env_file.chmod(0o600)
+        console.print("[green]✓[/green] .env creado (permisos 600)")
+
+    # --- Create first collection if none ---
+    settings = get_settings(project_root)
+    get_settings.cache_clear()
+    settings = get_settings(project_root)
+    mgr = CollectionManager(settings)
+    if not mgr.list():
+        default_info = mgr.create("default", display_name=domain_name,
+                                  description=f"Default {domain_name} collection")
+        mgr.set_active("default")
+        console.print(f"[green]✓[/green] Coleccion 'default' creada en {default_info.path}")
+
+    # --- Next steps ---
+    console.print("\n[bold]Listo.[/bold] Siguiente paso:")
+    active = mgr.get_active()
+    docs_path = settings._collection_dir(active) / "docs" if not mgr.get(active).is_legacy else settings.docs_path
+    console.print(f"  1. Copia PDFs a [cyan]{docs_path}[/cyan]")
+    console.print("     o usa: [cyan]rag docs add archivo.pdf[/cyan]")
+    console.print("  2. Indexa:     [cyan]rag ingest[/cyan]")
+    console.print("  3. Consulta:   [cyan]rag chat[/cyan]  (CLI interactivo)")
+    console.print("                 [cyan]rag serve[/cyan] (UI web en http://localhost:8765)")
+
+
+def _slugify(text: str) -> str:
+    """Turn a display name into a lowercase filesystem-safe slug."""
+    out = []
+    for ch in text.lower():
+        if ch.isalnum():
+            out.append(ch)
+        elif ch in " -_":
+            out.append("_")
+    slug = "".join(out).strip("_")
+    # Collapse repeated underscores
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug
+
+
+# ============================================================================
+# rag serve (FastAPI + web UI)
+# ============================================================================
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host de escucha"),
+    port: int = typer.Option(8765, "--port", "-p", help="Puerto"),
+    reload: bool = typer.Option(False, "--reload", help="Auto-reload (desarrollo)"),
+    project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
+) -> None:
+    """Iniciar el servidor FastAPI + UI web.
+
+    \b
+    Expone:
+      - Web UI en http://host:port/
+      - API REST en /api/*
+      - SSE streaming en POST /api/query
+
+    \b
+    La UI web permite cambiar entre colecciones, ver fuentes con
+    citas numericas [1][2], y el dashboard de metricas.
+
+    \b
+    Ejemplos:
+      rag serve                     # localhost:8765
+      rag serve --host 0.0.0.0      # accesible desde LAN
+      rag serve --port 8000
+    """
+    settings = get_settings(project_root)
+    if not _require_ready(settings, need_index=False):
+        return
+
+    try:
+        import uvicorn
+    except ImportError as e:
+        console.print("[red]Falta uvicorn. Instala: [cyan]pip install 'uvicorn[standard]'[/cyan][/red]")
+        raise typer.Exit(1) from e
+
+    os.environ["RAG_PROJECT_ROOT"] = str(Path(project_root).resolve())
+
+    console.print(LOGO)
+    console.print("[bold]Servidor RAG[/bold]")
+    console.print(f"  Web UI:  [cyan]http://{host}:{port}/[/cyan]")
+    console.print(f"  API:     [cyan]http://{host}:{port}/api[/cyan]")
+    console.print(f"  Docs:    [cyan]http://{host}:{port}/docs[/cyan]")
+    console.print()
+    console.print("[dim]Ctrl+C para detener.[/dim]\n")
+
+    uvicorn.run(
+        "rag.server_factory:app",
+        host=host,
+        port=port,
+        reload=reload,
+        log_level="info",
+    )
+
+
+# ============================================================================
+# rag stats (metrics dashboard in terminal)
+# ============================================================================
+
+
+@app.command()
+def stats(
+    collection: str = typer.Option(None, "--collection", "-c", help="Filtrar por coleccion"),
+    limit: int = typer.Option(10, "--limit", "-n", help="Ultimas N consultas a mostrar"),
+    project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
+) -> None:
+    """Ver metricas de uso: latencia, volumen, errores."""
+    settings = get_settings(project_root)
+    from rag.metrics import MetricsStore
+
+    store = MetricsStore(settings.metrics_db_path)
+    data = store.summary(limit=limit, collection=collection)
+
+    # Overview
+    ov = Table(title="Metricas", show_edge=False, box=box.SIMPLE)
+    ov.add_column("", style="cyan")
+    ov.add_column("", style="green", justify="right")
+    ov.add_row("Total de consultas", str(data["total"]))
+    ov.add_row("Errores", str(data["errors"]))
+    ov.add_row("Latencia media", f"{data['avg_latency_ms']} ms")
+    ov.add_row("Latencia p50", f"{data['p50_latency_ms']} ms")
+    ov.add_row("Latencia p95", f"{data['p95_latency_ms']} ms")
+    console.print(ov)
+
+    # Per-collection
+    if data["per_collection"] and not collection:
+        console.print()
+        pc = Table(title="Por coleccion", show_edge=False, box=box.SIMPLE)
+        pc.add_column("Coleccion", style="cyan")
+        pc.add_column("Consultas", justify="right")
+        pc.add_column("Latencia media", justify="right")
+        for row in data["per_collection"]:
+            pc.add_row(row["collection"], str(row["count"]), f"{row['avg_ms']} ms")
+        console.print(pc)
+
+    # Recent
+    if data["recent"]:
+        console.print()
+        rc = Table(title=f"Ultimas {len(data['recent'])}", show_edge=False, box=box.SIMPLE)
+        rc.add_column("#", style="dim", justify="right")
+        rc.add_column("Coleccion", style="cyan")
+        rc.add_column("Pregunta", style="white")
+        rc.add_column("Latencia", justify="right")
+        rc.add_column("Docs", justify="right")
+        for i, r in enumerate(data["recent"], 1):
+            q = r["question"][:60] + "..." if len(r["question"]) > 60 else r["question"]
+            err = " [red](err)[/red]" if r["error"] else ""
+            rc.add_row(
+                str(i), r["collection"], q + err,
+                f"{r['latency_ms']} ms", str(r["doc_count"]),
+            )
+        console.print(rc)
+    else:
+        console.print("\n[dim]Sin consultas registradas todavia.[/dim]")
 
 
 if __name__ == "__main__":

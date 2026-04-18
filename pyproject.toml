@@ -1,7 +1,7 @@
 [project]
-name = "rag-hydrology"
-version = "0.1.0"
-description = "State-of-the-art RAG system for hydrology research papers"
+name = "rag-assistant"
+version = "1.0.0"
+description = "Production-grade RAG over PDF corpora — hybrid retrieval, multi-collection, streaming, FastAPI + web UI."
 requires-python = ">=3.11"
 dependencies = [
     # LangChain core
@@ -25,16 +25,25 @@ dependencies = [
     "typer[all]>=0.12",
     "rich>=13.0",
     "python-dotenv>=1.0",
+    "prompt_toolkit>=3.0",
+    # HTTP server
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
     # Utilities
     "numpy>=1.26",
     "tqdm>=4.66",
     "rapidfuzz>=3.0",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
+    "pre-commit>=3.7",
 ]
 
 [project.scripts]
@@ -46,3 +55,40 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"rag" = ["web/*.html", "web/assets/*"]
+
+# --------------------------------------------------------------------------- #
+# Static hardening
+# --------------------------------------------------------------------------- #
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pyflakes + pycodestyle
+    "B",             # bugbear (common pitfalls)
+    "S",             # bandit-equivalent security rules
+    "UP",            # pyupgrade
+    "I",             # import order
+    "PIE",           # flake8-pie
+    "RUF",           # ruff-specific
+]
+ignore = [
+    "E501",   # long lines — rely on formatter
+    "S101",   # allow `assert` in tests + internal invariants
+    "S603",   # subprocess calls are reviewed per-use
+    "B008",   # typer uses defaults with function calls (Option/Argument)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B"]  # tests can use fixtures freely
+"src/rag/cli.py" = ["B008"]  # typer Option/Argument defaults
+
+[tool.bandit]
+exclude_dirs = ["tests", "data", ".venv"]
+skips = ["B101"]  # allow `assert` in non-test code for invariants

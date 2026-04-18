@@ -7,7 +7,7 @@ Self-RAG (Self-Reflective RAG) adds three verification steps:
 If checks fail, the system reformulates and retries.
 """
 
-import json
+from collections.abc import Iterator
 
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
@@ -18,6 +18,17 @@ from langchain_openai import ChatOpenAI
 from rich.console import Console
 
 from rag.config import Settings
+from rag.factories import get_chat_llm
+from rag.logging_setup import get_logger, new_request_id
+from rag.sanitize import (
+    MAX_CONTEXT_CHARS,
+    MAX_QUESTION_CHARS,
+    clamp_text,
+    escape_braces,
+    safe_json_loads,
+)
+
+log = get_logger(__name__)
 
 console = Console()
 
@@ -41,15 +52,8 @@ def _system_prompt(settings: Settings) -> str:
 
 
 def _build_llm(settings: Settings) -> ChatOpenAI:
-    """Build the LLM instance, supporting OpenRouter via base_url."""
-    kwargs = {
-        "model": settings.llm.model,
-        "temperature": settings.llm.temperature,
-        "openai_api_key": settings.llm_api_key,
-    }
-    if settings.llm_base_url:
-        kwargs["openai_api_base"] = settings.llm_base_url
-    return ChatOpenAI(**kwargs)
+    """Return the shared LLM client (cached across calls)."""
+    return get_chat_llm(settings)
 
 
 # ---------------------------------------------------------------------------
@@ -57,14 +61,37 @@ def _build_llm(settings: Settings) -> ChatOpenAI:
 # ---------------------------------------------------------------------------
 
 
+def extract_citation_numbers(answer: str) -> list[int]:
+    """Return the set of [N] citations referenced in the answer, in order of first use."""
+    import re
+    seen: dict[int, None] = {}
+    for match in re.finditer(r"\[(\d{1,3})\]", answer):
+        n = int(match.group(1))
+        if n not in seen:
+            seen[n] = None
+    return list(seen.keys())
+
+
 def format_documents(docs: list[Document]) -> str:
-    """Format retrieved documents with source citations for the prompt."""
+    """Format retrieved documents with numbered + named citations for the prompt.
+
+    Each document is prefixed with `[N]` (rank) AND the original
+    `[Source: filename, Page: N]` tag, so the LLM can cite with either
+    `[1][2]` (numeric, preferred for inline display) or
+    `[Source: filename, Page: N]` (legacy, still supported).
+
+    Chunk content is passed through escape_braces so literal `{...}` sequences
+    inside a PDF can't collide with ChatPromptTemplate's str.format() pass.
+    The concatenated context is also clamped to MAX_CONTEXT_CHARS as a
+    backstop against retriever misconfiguration.
+    """
     formatted = []
-    for doc in docs:
+    for i, doc in enumerate(docs, 1):
         source = doc.metadata.get("source", "unknown")
         page = doc.metadata.get("page", "?")
-        formatted.append(f"[Source: {source}, Page: {page}]\n{doc.page_content}")
-    return "\n\n---\n\n".join(formatted)
+        safe_content = escape_braces(doc.page_content)
+        formatted.append(f"[{i}] [Source: {source}, Page: {page}]\n{safe_content}")
+    return clamp_text("\n\n---\n\n".join(formatted), MAX_CONTEXT_CHARS)
 
 
 # ---------------------------------------------------------------------------
@@ -137,15 +164,17 @@ def _grade_documents(
             "documents": "\n\n".join(doc_texts),
             "domain_description": domain_description,
         })
-        # Parse JSON array
-        grades = json.loads(result.strip())
-        relevant = [
-            doc for doc, grade in zip(docs, grades)
-            if str(grade).lower().strip() == "yes"
-        ]
-        return relevant if relevant else docs[:2]  # Fallback: keep top 2
     except Exception:
-        return docs  # On error, keep all documents
+        return docs  # On LLM error, keep all documents
+
+    grades = safe_json_loads(result, fallback=[])
+    if not isinstance(grades, list):
+        return docs
+    relevant = [
+        doc for doc, grade in zip(docs, grades, strict=False)
+        if str(grade).lower().strip() == "yes"
+    ]
+    return relevant if relevant else docs[:2]  # Fallback: keep top 2
 
 
 def _reformulate_query(llm: ChatOpenAI, question: str) -> str:
@@ -174,9 +203,15 @@ def _check_hallucination(
             "context": context,
             "answer": answer,
         })
-        return json.loads(result.strip())
     except Exception:
         return {"grounded": "yes", "relevant": "yes", "issues": ""}
+
+    parsed = safe_json_loads(
+        result, fallback={"grounded": "yes", "relevant": "yes", "issues": ""},
+    )
+    if not isinstance(parsed, dict):
+        return {"grounded": "yes", "relevant": "yes", "issues": ""}
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -225,16 +260,28 @@ def build_rag_chain_with_sources(retriever: BaseRetriever, settings: Settings):
         return {"docs": docs, "context": format_documents(docs)}
 
     def chain_fn(question: str) -> dict:
+        rid = new_request_id()
+        question = clamp_text(question, MAX_QUESTION_CHARS)
+        log.info("rag.query.start", extra={"rid": rid, "q_len": len(question)})
         retrieval = retrieve_and_format(question)
+        log.info(
+            "rag.retrieved",
+            extra={"rid": rid, "doc_count": len(retrieval["docs"])},
+        )
         messages = prompt.invoke({
             "context": retrieval["context"],
             "question": question,
         })
         answer = llm.invoke(messages)
+        log.info(
+            "rag.answered",
+            extra={"rid": rid, "answer_len": len(answer.content)},
+        )
         return {
             "answer": answer.content,
             "source_documents": retrieval["docs"],
             "question": question,
+            "request_id": rid,
         }
 
     return chain_fn
@@ -282,6 +329,7 @@ def _build_self_rag_chain(
     ])
 
     def self_rag_fn(question: str) -> dict | str:
+        question = clamp_text(question, MAX_QUESTION_CHARS)
         reflection_log = []
         current_query = question
         relevant_docs = []
@@ -373,3 +421,224 @@ def _build_self_rag_chain(
             return answer
 
     return self_rag_fn
+
+
+# ---------------------------------------------------------------------------
+# Streaming chains (yield events for SSE / CLI live display)
+# ---------------------------------------------------------------------------
+#
+# Event schema:
+#   {"event": "retrieval_start"}                    — pipeline started
+#   {"event": "sources", "documents": [Document]}   — retrieved + filtered docs
+#   {"event": "reflection", "step": {...}}          — Self-RAG log entries
+#   {"event": "token", "content": "..."}            — one token / chunk
+#   {"event": "done", "answer": "...", ...}         — final answer + metadata
+#   {"event": "error", "message": "..."}            — failure
+#
+# This shape is stable: it's consumed by the CLI (Live panel) and the web UI
+# (Server-Sent Events). Don't repurpose event names without bumping the web
+# client.
+
+
+def _stream_llm_response(llm: ChatOpenAI, messages) -> Iterator[tuple[str, str]]:
+    """Yield (full_text_so_far, new_chunk) pairs from the LLM stream."""
+    buffer = ""
+    for chunk in llm.stream(messages):
+        piece = chunk.content or ""
+        if not piece:
+            continue
+        buffer += piece
+        yield buffer, piece
+
+
+def build_rag_chain_streaming(retriever: BaseRetriever, settings: Settings):
+    """Streaming RAG: emits retrieval + token-by-token answer events.
+
+    Returns a function `fn(question) -> Iterator[dict]` that yields typed
+    events. Self-RAG is supported: grading/reformulation run before the stream
+    begins, and the final generation phase is what gets streamed.
+    """
+    if settings.retrieval.self_rag:
+        return _build_self_rag_streaming(retriever, settings)
+
+    llm = _build_llm(settings)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", _system_prompt(settings)),
+        ("human", "{question}"),
+    ])
+
+    def stream_fn(question: str) -> Iterator[dict]:
+        rid = new_request_id()
+        question = clamp_text(question, MAX_QUESTION_CHARS)
+        log.info("rag.stream.start", extra={"rid": rid, "q_len": len(question)})
+
+        yield {"event": "retrieval_start", "request_id": rid}
+
+        try:
+            docs = retriever.invoke(question)
+        except Exception as e:
+            log.warning("rag.retrieval.failed", extra={"rid": rid, "err": str(e)})
+            yield {"event": "error", "message": f"Retrieval failed: {e}"}
+            return
+
+        yield {"event": "sources", "documents": docs, "request_id": rid}
+
+        context = format_documents(docs)
+        messages = prompt.invoke({"context": context, "question": question})
+
+        answer = ""
+        try:
+            for full, piece in _stream_llm_response(llm, messages):
+                answer = full
+                yield {"event": "token", "content": piece}
+        except Exception as e:
+            log.warning("rag.stream.failed", extra={"rid": rid, "err": str(e)})
+            yield {"event": "error", "message": f"Generation failed: {e}"}
+            return
+
+        log.info(
+            "rag.stream.done",
+            extra={"rid": rid, "answer_len": len(answer), "docs": len(docs)},
+        )
+        yield {
+            "event": "done",
+            "answer": answer,
+            "source_documents": docs,
+            "question": question,
+            "request_id": rid,
+        }
+
+    return stream_fn
+
+
+def _build_self_rag_streaming(retriever: BaseRetriever, settings: Settings):
+    """Self-RAG flavor of the streaming chain.
+
+    The retrieve-grade-reformulate loop runs eagerly (not streamable), emitting
+    reflection events as it goes. Only the final generation is streamed. If
+    hallucination is detected, the regenerated answer is streamed as a fresh
+    series of token events after a reflection event explaining the retry.
+    """
+    llm = _build_llm(settings)
+    grader_llm = _build_llm(settings)
+    max_retries = settings.retrieval.self_rag_max_retries
+    system_prompt_text = _system_prompt(settings)
+    grader_description = settings.domain.grader_description
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt_text),
+        ("human", "{question}"),
+    ])
+    stricter_prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt_text + "\n\nIMPORTANT: A previous answer was found to "
+         "contain unsupported claims. Be extra careful to ONLY state facts that are "
+         "explicitly present in the context. If unsure, say you don't have enough "
+         "information."),
+        ("human", "{question}"),
+    ])
+
+    def stream_fn(question: str) -> Iterator[dict]:
+        rid = new_request_id()
+        question = clamp_text(question, MAX_QUESTION_CHARS)
+        yield {"event": "retrieval_start", "request_id": rid}
+
+        reflection_log: list[dict] = []
+        current_query = question
+        relevant_docs: list[Document] = []
+
+        for attempt in range(max_retries + 1):
+            try:
+                docs = retriever.invoke(current_query)
+            except Exception as e:
+                yield {"event": "error", "message": f"Retrieval failed: {e}"}
+                return
+
+            relevant_docs = _grade_documents(
+                grader_llm, question, docs, domain_description=grader_description,
+            )
+            ratio = len(relevant_docs) / max(len(docs), 1)
+            step = {
+                "step": "grade_documents",
+                "attempt": attempt + 1,
+                "query": current_query,
+                "retrieved": len(docs),
+                "relevant": len(relevant_docs),
+                "ratio": round(ratio, 2),
+            }
+            reflection_log.append(step)
+            yield {"event": "reflection", "step": step}
+
+            if ratio >= 0.3 or len(relevant_docs) >= 2:
+                break
+
+            if attempt < max_retries:
+                current_query = _reformulate_query(grader_llm, current_query)
+                step = {
+                    "step": "reformulate",
+                    "original": question,
+                    "reformulated": current_query,
+                }
+                reflection_log.append(step)
+                yield {"event": "reflection", "step": step}
+
+        yield {"event": "sources", "documents": relevant_docs, "request_id": rid}
+
+        context = format_documents(relevant_docs)
+        messages = prompt.invoke({"context": context, "question": question})
+
+        answer = ""
+        try:
+            for full, piece in _stream_llm_response(llm, messages):
+                answer = full
+                yield {"event": "token", "content": piece}
+        except Exception as e:
+            yield {"event": "error", "message": f"Generation failed: {e}"}
+            return
+
+        reflection_log.append({"step": "generate", "context_docs": len(relevant_docs)})
+
+        # Hallucination check (post-stream, synchronous)
+        grading = _check_hallucination(grader_llm, question, context, answer)
+        hallu_step = {"step": "hallucination_check", **grading}
+        reflection_log.append(hallu_step)
+        yield {"event": "reflection", "step": hallu_step}
+
+        if grading.get("grounded") == "no":
+            retry_step = {"step": "regenerate", "reason": "hallucination detected"}
+            reflection_log.append(retry_step)
+            yield {"event": "reflection", "step": retry_step}
+            yield {"event": "regenerating"}
+
+            messages = stricter_prompt.invoke({"context": context, "question": question})
+            answer = ""
+            try:
+                for full, piece in _stream_llm_response(llm, messages):
+                    answer = full
+                    yield {"event": "token", "content": piece, "regenerated": True}
+            except Exception as e:
+                yield {"event": "error", "message": f"Regeneration failed: {e}"}
+                return
+
+            grading = _check_hallucination(grader_llm, question, context, answer)
+            recheck_step = {"step": "hallucination_recheck", **grading}
+            reflection_log.append(recheck_step)
+            yield {"event": "reflection", "step": recheck_step}
+
+        if grading.get("relevant") == "no":
+            note = (
+                "\n\n*Note: The retrieved context may not fully address this question. "
+                "Consider rephrasing or checking if the relevant documents are indexed.*"
+            )
+            answer += note
+            yield {"event": "token", "content": note}
+
+        yield {
+            "event": "done",
+            "answer": answer,
+            "source_documents": relevant_docs,
+            "question": question,
+            "request_id": rid,
+            "reflection": reflection_log,
+        }
+
+    return stream_fn

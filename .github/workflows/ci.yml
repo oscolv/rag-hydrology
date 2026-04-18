@@ -1,0 +1,117 @@
+---
+# Continuous integration for the RAG pipeline.
+#
+# Runs on every push and PR. Four parallel jobs:
+#   - lint:       ruff check + ruff format --check
+#   - test:       pytest (fast unit tests only; no network, no real models)
+#   - security:   bandit + pip-audit + gitleaks
+#   - build:      import smoke test to catch dependency/packaging regressions
+#
+# Secrets-free by design — no API keys are needed. Tests that require an LLM
+# should be marked with `@pytest.mark.integration` and excluded here; a
+# separate `integration.yml` (not yet written) will run those on a schedule
+# with real credentials.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs when new commits land on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install ruff
+        run: pip install "ruff>=0.8"
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+
+  test:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: pytest
+        run: pytest -q --maxfail=3 -m "not integration"
+        env:
+          # Tests should never need these, but set dummies so any accidental
+          # client construction fails fast with a clear error rather than
+          # reading an empty environment.
+          OPENAI_API_KEY: test-dummy-do-not-use
+          COHERE_API_KEY: test-dummy-do-not-use
+
+  security:
+    name: Security scans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs full history to scan every commit on the ref.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install scanners
+        run: pip install "bandit>=1.7" "pip-audit>=2.7"
+
+      - name: bandit (static security analysis)
+        run: bandit -r src/ -c pyproject.toml
+
+      - name: pip-audit (known CVEs in dependencies)
+        # --strict turns advisories into failures. If a transitive dep has no
+        # available fix, pin the vulnerable one here and add a comment.
+        run: pip-audit --strict --progress-spinner off
+
+      - name: gitleaks (secret scan)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  build:
+    name: Import smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e .
+      - name: Import every module
+        # Catches missing deps, broken imports, circular refs that pytest
+        # wouldn't exercise if the failing module has no tests.
+        run: |
+          python -c "
+          import importlib, pkgutil, rag
+          for mod in pkgutil.walk_packages(rag.__path__, prefix='rag.'):
+              importlib.import_module(mod.name)
+          print('all modules import cleanly')
+          "
