@@ -199,6 +199,18 @@ def status(
         True,
     )
 
+    # Tracing (Langfuse)
+    from rag.tracing import host as tracing_host
+    from rag.tracing import is_enabled as tracing_enabled
+    if tracing_enabled():
+        _print_check(f"Tracing (Langfuse): ON @ {tracing_host()}", True)
+    else:
+        _print_check("Tracing (Langfuse): OFF", True)
+        console.print(
+            "       [dim]Opcional: configura LANGFUSE_PUBLIC_KEY/SECRET_KEY en .env "
+            "(plan free en cloud.langfuse.com)[/dim]"
+        )
+
     # Docs
     pdfs = list(settings.docs_path.glob("*.pdf"))
     _print_check(f"Documentos PDF ({len(pdfs)} encontrados)", len(pdfs) > 0)
@@ -760,6 +772,12 @@ def evaluate_cmd(
     generate: bool = typer.Option(False, "--generate", "-g", help="Generar test set sintetico primero"),
     size: int = typer.Option(None, "--size", "-s", help="Numero de preguntas a generar (default: config.yaml)"),
     testset: str = typer.Option(None, help="Ruta a un test set CSV existente"),
+    golden: bool = typer.Option(False, "--golden", help="Evaluar contra data/golden/*.yaml (curado a mano)"),
+    from_feedback: bool = typer.Option(
+        False, "--from-feedback",
+        help="Re-evaluar queries con feedback negativo registrado en metrics.sqlite3",
+    ),
+    feedback_limit: int = typer.Option(50, "--feedback-limit", help="Maximo de queries de feedback a evaluar"),
     collection: str = typer.Option(None, "--collection", "-c", help="Coleccion (default: activa)"),
     project_root: str = typer.Option(".", "--root", "-r", help="Directorio raiz"),
 ) -> None:
@@ -797,13 +815,63 @@ def evaluate_cmd(
     if not _require_ready(settings):
         raise typer.Exit(1)
 
-    from rag.evaluation import generate_testset, run_evaluation
+    # Mutually exclusive sources-of-truth
+    chosen = sum(bool(x) for x in (generate, golden, from_feedback))
+    if chosen > 1:
+        console.print(
+            "[red]--generate, --golden y --from-feedback son mutuamente exclusivos.[/red]"
+        )
+        raise typer.Exit(2)
+
+    from rag.evaluation import generate_testset, load_golden_set, run_evaluation
     from rag.generation import build_rag_chain_with_sources
+    from rag.metrics import MetricsStore
     from rag.retrieval import build_retriever
 
     testset_path = Path(testset) if testset else None
 
-    if generate:
+    if golden:
+        golden_dir = settings.project_root / "data" / "golden"
+        df = load_golden_set(golden_dir)
+        if df.empty:
+            console.print(
+                f"[yellow]No se encontraron golden YAMLs en {golden_dir}.[/yellow]\n"
+                "  Crea uno siguiendo el formato de [cyan]data/golden/example.yaml[/cyan]."
+            )
+            raise typer.Exit(1)
+        testset_path = settings.data_path / ".golden_testset.csv"
+        testset_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(testset_path, index=False)
+        console.print(
+            f"[bold]Cargadas {len(df)} preguntas curadas de {golden_dir}[/bold]\n"
+        )
+
+    elif from_feedback:
+        import pandas as pd
+        store = MetricsStore(settings.metrics_db_path)
+        rows = store.list_negative_feedback(
+            collection=settings.active_collection, limit=feedback_limit,
+        )
+        if not rows:
+            console.print(
+                "[yellow]No hay feedback negativo registrado para la coleccion activa.[/yellow]\n"
+                "  Marca respuestas como 'no util' en la UI web (/) o via "
+                "[cyan]POST /api/feedback[/cyan]."
+            )
+            raise typer.Exit(1)
+        df = pd.DataFrame([
+            {"user_input": r["question"], "reference": ""} for r in rows
+        ])
+        testset_path = settings.data_path / ".feedback_testset.csv"
+        testset_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(testset_path, index=False)
+        console.print(
+            f"[bold]Re-evaluando {len(df)} queries con feedback negativo[/bold]\n"
+            "  [dim]context_recall sera NaN (no hay reference); usa --golden si quieres "
+            "esa metrica.[/dim]\n"
+        )
+
+    elif generate:
         console.print("[bold]Paso 1/2: Generando test set sintetico...[/bold]\n")
         generate_testset(settings, output_path=testset_path, testset_size=size)
         console.print()

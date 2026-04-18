@@ -33,6 +33,22 @@ def test_health_endpoint(client):
     assert body["ok"] is True
     assert "active_collection" in body
     assert "model" in body
+    assert "tracing" in body
+    assert body["tracing"]["enabled"] is False  # no LANGFUSE_* env vars in tests
+    assert body["tracing"]["host"] is None
+
+
+def test_health_endpoint_reports_tracing_when_enabled(client, monkeypatch):
+    from rag import tracing
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+    monkeypatch.setenv("LANGFUSE_HOST", "http://localhost:3000")
+    tracing.reset_for_tests()
+
+    r = client.get("/api/health")
+    body = r.json()
+    assert body["tracing"]["enabled"] is True
+    assert body["tracing"]["host"] == "http://localhost:3000"
 
 
 def test_list_collections_empty(client):
@@ -123,3 +139,44 @@ def test_pipeline_invalidate(client):
     r = client.post("/api/pipeline/invalidate")
     assert r.status_code == 200
     assert r.json()["invalidated"] == "all"
+
+
+# ----------------------------------------------------------------------
+# Feedback endpoint
+# ----------------------------------------------------------------------
+
+
+def test_feedback_accepts_thumbs_up(client):
+    r = client.post("/api/feedback", json={
+        "rating": 1,
+        "request_id": "abc",
+        "question": "what is GRACE?",
+        "answer": "GRACE is...",
+    })
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+
+def test_feedback_accepts_thumbs_down_with_comment(client):
+    r = client.post("/api/feedback", json={
+        "rating": -1,
+        "comment": "missed the citation",
+        "question": "what is GRACE?",
+    })
+    assert r.status_code == 200
+
+
+def test_feedback_rejects_invalid_rating(client):
+    r = client.post("/api/feedback", json={"rating": 0, "question": "q"})
+    assert r.status_code == 400
+
+
+def test_feedback_round_trip_appears_in_stats(client):
+    client.post("/api/feedback", json={"rating": 1, "question": "ok"})
+    client.post("/api/feedback", json={"rating": -1, "question": "bad1"})
+    client.post("/api/feedback", json={"rating": -1, "question": "bad2"})
+
+    r = client.get("/api/stats")
+    body = r.json()
+    assert body["feedback"]["positive"] == 1
+    assert body["feedback"]["negative"] == 2

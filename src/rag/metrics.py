@@ -30,6 +30,21 @@ CREATE TABLE IF NOT EXISTS queries (
 
 CREATE INDEX IF NOT EXISTS idx_queries_ts ON queries(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_queries_collection ON queries(collection);
+
+CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    request_id TEXT,
+    rating INTEGER NOT NULL CHECK(rating IN (-1, 1)),
+    comment TEXT,
+    collection TEXT,
+    question TEXT,
+    answer TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_ts ON feedback(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating);
+CREATE INDEX IF NOT EXISTS idx_feedback_collection ON feedback(collection);
 """
 
 
@@ -89,6 +104,82 @@ class MetricsStore:
                 ),
             )
 
+    def record_feedback(
+        self,
+        rating: int,
+        request_id: str | None = None,
+        comment: str | None = None,
+        collection: str | None = None,
+        question: str | None = None,
+        answer: str | None = None,
+    ) -> None:
+        """Persist a thumbs up/down + optional comment for a previous answer.
+
+        rating must be +1 or -1. Other fields are denormalized so the row is
+        self-contained: we don't need to join against `queries` to know what
+        the user was reacting to.
+        """
+        if rating not in (-1, 1):
+            raise ValueError(f"rating must be -1 or +1, got {rating!r}")
+        self.ensure_schema()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO feedback "
+                "(ts, request_id, rating, comment, collection, question, answer) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    time(),
+                    request_id,
+                    int(rating),
+                    (comment[:4000] if comment else None),
+                    collection,
+                    (question[:2000] if question else None),
+                    (answer[:8000] if answer else None),
+                ),
+            )
+
+    def list_negative_feedback(
+        self,
+        collection: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return recent thumbs-down rows for evaluating regressions.
+
+        Deduplicates by question text — multiple downvotes on the same query
+        only surface once, with the most recent comment.
+        """
+        self.ensure_schema()
+        params: tuple = (-1,)
+        where = "WHERE rating = ?"
+        if collection:
+            where += " AND collection = ?"
+            params = (-1, collection)
+        sql = (
+            f"SELECT ts, request_id, rating, comment, collection, question, answer "  # noqa: S608
+            f"FROM feedback {where} ORDER BY ts DESC LIMIT ?"
+        )
+        with self._connect() as conn:
+            rows = conn.execute(sql, (*params, limit * 5)).fetchall()
+        seen: set[str] = set()
+        out: list[dict] = []
+        for r in rows:
+            q = (r["question"] or "").strip()
+            if not q or q in seen:
+                continue
+            seen.add(q)
+            out.append({
+                "ts": r["ts"],
+                "request_id": r["request_id"],
+                "rating": r["rating"],
+                "comment": r["comment"],
+                "collection": r["collection"],
+                "question": q,
+                "answer": r["answer"],
+            })
+            if len(out) >= limit:
+                break
+        return out
+
     def summary(self, limit: int = 50, collection: str | None = None) -> dict:
         """Return dashboard-ready aggregates and recent history."""
         self.ensure_schema()
@@ -140,6 +231,14 @@ class MetricsStore:
             )
             recent = conn.execute(recent_sql, (*params, limit)).fetchall()
 
+            fb_sql = (
+                "SELECT "  # noqa: S608
+                "  SUM(CASE WHEN rating = 1 THEN 1 ELSE 0 END) AS pos, "
+                "  SUM(CASE WHEN rating = -1 THEN 1 ELSE 0 END) AS neg "
+                f"FROM feedback {where if where else ''}"
+            )
+            fb = conn.execute(fb_sql, params).fetchone()
+
         return {
             "total": int(totals["n"] or 0),
             "errors": int(totals["errors"] or 0),
@@ -161,4 +260,8 @@ class MetricsStore:
                 }
                 for r in recent
             ],
+            "feedback": {
+                "positive": int(fb["pos"] or 0),
+                "negative": int(fb["neg"] or 0),
+            },
         }

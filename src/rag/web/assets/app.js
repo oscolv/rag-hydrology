@@ -87,6 +87,11 @@ function ragApp() {
         documents: [],
         reflection: [],
         citations: [],
+        request_id: "",
+        feedback: 0,           // 0 = none, 1 = up, -1 = down
+        feedbackComment: "",
+        feedbackCommentOpen: false,
+        feedbackSending: false,
         model: this.health.model || "",
         streaming: true,
         status: "Conectando con el servidor...",
@@ -152,6 +157,7 @@ function ragApp() {
             msg.documents = data.documents;
             msg.reflection = data.reflection || msg.reflection;
             msg.citations = data.citations || [];
+            msg.request_id = data.request_id || msg.request_id;
             msg.streaming = false;
           } else if (event === "error") {
             msg.answer += `\n\n**Error:** ${data.message}`;
@@ -281,6 +287,36 @@ function ragApp() {
         const el = this.$refs.messages;
         if (el) el.scrollTop = el.scrollHeight;
       });
+    },
+
+    async sendFeedback(msg, rating, comment) {
+      if (msg.feedbackSending) return;
+      msg.feedbackSending = true;
+      try {
+        const r = await fetch("/api/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            rating,
+            request_id: msg.request_id || null,
+            comment: comment || null,
+            question: msg.question,
+            answer: msg.answer,
+            collection: this.activeCollection?.name || null,
+          }),
+        });
+        if (!r.ok) {
+          const txt = await r.text();
+          throw new Error(`${r.status}: ${txt}`);
+        }
+        msg.feedback = rating;
+        msg.feedbackCommentOpen = false;
+        this.showToast(rating > 0 ? "Gracias por el feedback" : "Anotado: lo veremos");
+      } catch (e) {
+        this.showToast("Error: " + e.message);
+      } finally {
+        msg.feedbackSending = false;
+      }
     },
 
     async loadStats() {

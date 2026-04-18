@@ -731,6 +731,89 @@ main > section[style*="display: none"] { display: none !important; }
 }
 
 /* ============================================================================
+ * FEEDBACK
+ * ========================================================================= */
+
+.feedback {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+.feedback-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.feedback-label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
+}
+.fb-btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: color .12s, border-color .12s, background .12s;
+}
+.fb-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.fb-btn:disabled { opacity: .5; cursor: default; }
+.fb-btn-primary {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.fb-btn-primary:hover:not(:disabled) {
+  background: var(--accent-dim);
+  border-color: var(--accent-dim);
+  color: var(--bg);
+}
+.fb-comment {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fb-textarea {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  resize: vertical;
+  min-height: 48px;
+}
+.fb-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.fb-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.fb-done {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent-dim);
+}
+
+/* ============================================================================
  * SOURCES
  * ========================================================================= */
 

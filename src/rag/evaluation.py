@@ -5,6 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pandas as pd
+import yaml
 from datasets import Dataset
 from langchain_chroma import Chroma
 from langchain_openai import ChatOpenAI
@@ -44,6 +45,41 @@ def _build_eval_llm(settings: Settings) -> ChatOpenAI:
         openai_api_key=settings.openai_api_key,
         max_retries=5,
         request_timeout=120,
+    )
+
+
+def load_golden_set(directory: Path) -> pd.DataFrame:
+    """Load curated YAML golden files into the same shape as the synthetic testset.
+
+    Reads every ``*.yaml`` under ``directory``. Each file is a list of dicts
+    with keys: ``question`` (required), ``expected_answer``, ``expected_sources``
+    (list[str]), ``notes``.
+
+    Returns a DataFrame with columns ``user_input``, ``reference``,
+    ``expected_sources``, ``notes`` — compatible with run_evaluation().
+    """
+    if not directory.exists():
+        return pd.DataFrame(columns=["user_input", "reference", "expected_sources", "notes"])
+
+    rows: list[dict] = []
+    for path in sorted(directory.glob("*.yaml")):
+        with open(path) as f:
+            data = yaml.safe_load(f) or []
+        if not isinstance(data, list):
+            raise ValueError(
+                f"{path} must contain a YAML list of golden entries, got {type(data).__name__}"
+            )
+        for item in data:
+            if not isinstance(item, dict) or "question" not in item:
+                raise ValueError(f"{path}: every entry must be a dict with a 'question' key")
+            rows.append({
+                "user_input": str(item["question"]).strip(),
+                "reference": str(item.get("expected_answer", "")).strip(),
+                "expected_sources": list(item.get("expected_sources", []) or []),
+                "notes": str(item.get("notes", "")).strip(),
+            })
+    return pd.DataFrame(
+        rows, columns=["user_input", "reference", "expected_sources", "notes"]
     )
 
 

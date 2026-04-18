@@ -19,6 +19,8 @@ dependencies = [
     # Evaluation
     "ragas>=0.2",
     "datasets>=3.0",
+    # Observability (no-op when LANGFUSE_* env vars are unset)
+    "langfuse>=3,<4",
     # Config & CLI
     "pydantic-settings>=2.5",
     "pyyaml>=6.0",

@@ -1,0 +1,37 @@
+# Golden set — anchor queries with hand-curated expected answers and sources.
+#
+# Each entry is one (query, ground-truth) pair. They are versioned in the repo
+# so regressions become a diff. Used by:
+#
+#     rag evaluate --golden
+#
+# Fields:
+#   question:         the user input
+#   expected_answer:  reference answer used by RAGAS LLMContextRecall.
+#                     Doesn't need to match exactly; describe the key facts.
+#   expected_sources: optional list of filenames that *should* appear in the
+#                     retrieved context. Currently informational; future
+#                     versions can compute precision/recall over this.
+#   notes:            free text — why this query is in the golden set.
+
+- question: "What is GRACE and how does it measure terrestrial water storage?"
+  expected_answer: |
+    GRACE (Gravity Recovery and Climate Experiment) is a NASA/DLR satellite
+    mission consisting of twin satellites that measure tiny variations in
+    Earth's gravity field. By tracking changes in the inter-satellite distance
+    over time, GRACE infers monthly mass redistribution at the Earth's surface,
+    which over land is dominated by terrestrial water storage (TWS) anomalies
+    — the sum of groundwater, soil moisture, surface water, snow, and ice.
+  expected_sources:
+    - tapley2004.pdf
+    - landerer2012.pdf
+  notes: "Anchor query: GRACE basics. Should retrieve foundational papers."
+
+- question: "Que informacion contiene el atlas del agua?"
+  expected_answer: |
+    El atlas del agua contiene informacion estadistica y cartografica sobre
+    los recursos hidricos de Mexico: disponibilidad, usos, calidad, y
+    distribucion regional del agua superficial y subterranea.
+  expected_sources:
+    - atlas_agua.pdf
+  notes: "Spanish-language query against a Spanish source — checks bilingual retrieval."

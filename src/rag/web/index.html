@@ -189,6 +189,56 @@
                             </details>
                           </template>
 
+                          <!-- Feedback widget -->
+                          <template x-if="!m.streaming && m.answer">
+                            <div class="feedback">
+                              <template x-if="m.feedback === 0">
+                                <div class="feedback-row">
+                                  <span class="feedback-label">¿FUE ÚTIL?</span>
+                                  <button
+                                    type="button"
+                                    class="fb-btn"
+                                    :disabled="m.feedbackSending"
+                                    @click="sendFeedback(m, 1)"
+                                    title="Sí"
+                                  >[+] útil</button>
+                                  <button
+                                    type="button"
+                                    class="fb-btn"
+                                    :disabled="m.feedbackSending"
+                                    @click="m.feedbackCommentOpen = true"
+                                    title="No"
+                                  >[−] no útil</button>
+                                </div>
+                              </template>
+                              <template x-if="m.feedback === 0 && m.feedbackCommentOpen">
+                                <form class="fb-comment" @submit.prevent="sendFeedback(m, -1, m.feedbackComment)">
+                                  <textarea
+                                    x-model="m.feedbackComment"
+                                    rows="2"
+                                    placeholder="¿qué falló? (opcional)"
+                                    class="fb-textarea"
+                                  ></textarea>
+                                  <div class="fb-actions">
+                                    <button
+                                      type="button"
+                                      class="fb-btn"
+                                      @click="m.feedbackCommentOpen = false; m.feedbackComment = ''"
+                                    >cancelar</button>
+                                    <button
+                                      type="submit"
+                                      class="fb-btn fb-btn-primary"
+                                      :disabled="m.feedbackSending"
+                                    >enviar</button>
+                                  </div>
+                                </form>
+                              </template>
+                              <template x-if="m.feedback !== 0">
+                                <div class="fb-done" x-text="m.feedback === 1 ? '✓ marcado como útil' : '✓ feedback registrado'"></div>
+                              </template>
+                            </div>
+                          </template>
+
                         </div>
 
                         <!-- Sources -->

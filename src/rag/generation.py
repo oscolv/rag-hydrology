@@ -27,6 +27,18 @@ from rag.sanitize import (
     escape_braces,
     safe_json_loads,
 )
+from rag.tracing import trace_config
+
+
+def _trace_meta(settings: Settings, rid: str, **extra) -> dict:
+    """Build the metadata dict attached to every Langfuse trace for a query."""
+    meta = {
+        "request_id": rid,
+        "collection": settings.active_collection,
+        "model": settings.llm.model,
+    }
+    meta.update(extra)
+    return meta
 
 log = get_logger(__name__)
 
@@ -143,6 +155,7 @@ def _grade_documents(
     question: str,
     docs: list[Document],
     domain_description: str = "a research RAG system",
+    config: dict | None = None,
 ) -> list[Document]:
     """Grade each document's relevance to the question. Return only relevant docs."""
     if not docs:
@@ -163,7 +176,7 @@ def _grade_documents(
             "question": question,
             "documents": "\n\n".join(doc_texts),
             "domain_description": domain_description,
-        })
+        }, config=config or {})
     except Exception:
         return docs  # On LLM error, keep all documents
 
@@ -177,12 +190,12 @@ def _grade_documents(
     return relevant if relevant else docs[:2]  # Fallback: keep top 2
 
 
-def _reformulate_query(llm: ChatOpenAI, question: str) -> str:
+def _reformulate_query(llm: ChatOpenAI, question: str, config: dict | None = None) -> str:
     """Reformulate a query when retrieved documents are not relevant."""
     prompt = ChatPromptTemplate.from_messages([("human", _REFORMULATE_PROMPT)])
     chain = prompt | llm | StrOutputParser()
     try:
-        return chain.invoke({"question": question}).strip()
+        return chain.invoke({"question": question}, config=config or {}).strip()
     except Exception:
         return question
 
@@ -192,6 +205,7 @@ def _check_hallucination(
     question: str,
     context: str,
     answer: str,
+    config: dict | None = None,
 ) -> dict:
     """Check if the answer is grounded and relevant. Returns grading dict."""
     prompt = ChatPromptTemplate.from_messages([("human", _HALLUCINATION_PROMPT)])
@@ -202,7 +216,7 @@ def _check_hallucination(
             "question": question,
             "context": context,
             "answer": answer,
-        })
+        }, config=config or {})
     except Exception:
         return {"grounded": "yes", "relevant": "yes", "issues": ""}
 
@@ -255,31 +269,26 @@ def build_rag_chain_with_sources(retriever: BaseRetriever, settings: Settings):
         ("human", "{question}"),
     ])
 
-    def retrieve_and_format(question: str) -> dict:
-        docs = retriever.invoke(question)
-        return {"docs": docs, "context": format_documents(docs)}
-
     def chain_fn(question: str) -> dict:
         rid = new_request_id()
         question = clamp_text(question, MAX_QUESTION_CHARS)
+        cfg = trace_config("rag.query", _trace_meta(settings, rid))
         log.info("rag.query.start", extra={"rid": rid, "q_len": len(question)})
-        retrieval = retrieve_and_format(question)
-        log.info(
-            "rag.retrieved",
-            extra={"rid": rid, "doc_count": len(retrieval["docs"])},
-        )
+        docs = retriever.invoke(question, config=cfg)
+        context = format_documents(docs)
+        log.info("rag.retrieved", extra={"rid": rid, "doc_count": len(docs)})
         messages = prompt.invoke({
-            "context": retrieval["context"],
+            "context": context,
             "question": question,
         })
-        answer = llm.invoke(messages)
+        answer = llm.invoke(messages, config=cfg)
         log.info(
             "rag.answered",
             extra={"rid": rid, "answer_len": len(answer.content)},
         )
         return {
             "answer": answer.content,
-            "source_documents": retrieval["docs"],
+            "source_documents": docs,
             "question": question,
             "request_id": rid,
         }
@@ -329,16 +338,19 @@ def _build_self_rag_chain(
     ])
 
     def self_rag_fn(question: str) -> dict | str:
+        rid = new_request_id()
         question = clamp_text(question, MAX_QUESTION_CHARS)
+        cfg = trace_config("rag.query.self_rag", _trace_meta(settings, rid))
         reflection_log = []
         current_query = question
         relevant_docs = []
 
         # --- Phase 1: Retrieve & Grade (with retry) ---
         for attempt in range(max_retries + 1):
-            docs = retriever.invoke(current_query)
+            docs = retriever.invoke(current_query, config=cfg)
             relevant_docs = _grade_documents(
-                grader_llm, question, docs, domain_description=grader_description,
+                grader_llm, question, docs,
+                domain_description=grader_description, config=cfg,
             )
 
             relevance_ratio = len(relevant_docs) / max(len(docs), 1)
@@ -357,7 +369,7 @@ def _build_self_rag_chain(
 
             # Otherwise, reformulate and retry
             if attempt < max_retries:
-                current_query = _reformulate_query(grader_llm, current_query)
+                current_query = _reformulate_query(grader_llm, current_query, config=cfg)
                 reflection_log.append({
                     "step": "reformulate",
                     "original": question,
@@ -370,7 +382,7 @@ def _build_self_rag_chain(
             "context": context,
             "question": question,  # Always use original question for generation
         })
-        answer = llm.invoke(messages).content
+        answer = llm.invoke(messages, config=cfg).content
 
         reflection_log.append({
             "step": "generate",
@@ -378,7 +390,7 @@ def _build_self_rag_chain(
         })
 
         # --- Phase 3: Hallucination & Relevance Check ---
-        grading = _check_hallucination(grader_llm, question, context, answer)
+        grading = _check_hallucination(grader_llm, question, context, answer, config=cfg)
         reflection_log.append({
             "step": "hallucination_check",
             **grading,
@@ -390,14 +402,16 @@ def _build_self_rag_chain(
                 "context": context,
                 "question": question,
             })
-            answer = llm.invoke(messages).content
+            answer = llm.invoke(messages, config=cfg).content
             reflection_log.append({
                 "step": "regenerate",
                 "reason": "hallucination detected",
             })
 
             # Re-check after regeneration
-            grading = _check_hallucination(grader_llm, question, context, answer)
+            grading = _check_hallucination(
+                grader_llm, question, context, answer, config=cfg,
+            )
             reflection_log.append({
                 "step": "hallucination_recheck",
                 **grading,
@@ -415,6 +429,7 @@ def _build_self_rag_chain(
                 "answer": answer,
                 "source_documents": relevant_docs,
                 "question": question,
+                "request_id": rid,
                 "reflection": reflection_log,
             }
         else:
@@ -440,10 +455,12 @@ def _build_self_rag_chain(
 # client.
 
 
-def _stream_llm_response(llm: ChatOpenAI, messages) -> Iterator[tuple[str, str]]:
+def _stream_llm_response(
+    llm: ChatOpenAI, messages, config: dict | None = None,
+) -> Iterator[tuple[str, str]]:
     """Yield (full_text_so_far, new_chunk) pairs from the LLM stream."""
     buffer = ""
-    for chunk in llm.stream(messages):
+    for chunk in llm.stream(messages, config=config or {}):
         piece = chunk.content or ""
         if not piece:
             continue
@@ -470,12 +487,13 @@ def build_rag_chain_streaming(retriever: BaseRetriever, settings: Settings):
     def stream_fn(question: str) -> Iterator[dict]:
         rid = new_request_id()
         question = clamp_text(question, MAX_QUESTION_CHARS)
+        cfg = trace_config("rag.query.stream", _trace_meta(settings, rid))
         log.info("rag.stream.start", extra={"rid": rid, "q_len": len(question)})
 
         yield {"event": "retrieval_start", "request_id": rid}
 
         try:
-            docs = retriever.invoke(question)
+            docs = retriever.invoke(question, config=cfg)
         except Exception as e:
             log.warning("rag.retrieval.failed", extra={"rid": rid, "err": str(e)})
             yield {"event": "error", "message": f"Retrieval failed: {e}"}
@@ -488,7 +506,7 @@ def build_rag_chain_streaming(retriever: BaseRetriever, settings: Settings):
 
         answer = ""
         try:
-            for full, piece in _stream_llm_response(llm, messages):
+            for full, piece in _stream_llm_response(llm, messages, config=cfg):
                 answer = full
                 yield {"event": "token", "content": piece}
         except Exception as e:
@@ -540,6 +558,7 @@ def _build_self_rag_streaming(retriever: BaseRetriever, settings: Settings):
     def stream_fn(question: str) -> Iterator[dict]:
         rid = new_request_id()
         question = clamp_text(question, MAX_QUESTION_CHARS)
+        cfg = trace_config("rag.query.self_rag.stream", _trace_meta(settings, rid))
         yield {"event": "retrieval_start", "request_id": rid}
 
         reflection_log: list[dict] = []
@@ -548,13 +567,14 @@ def _build_self_rag_streaming(retriever: BaseRetriever, settings: Settings):
 
         for attempt in range(max_retries + 1):
             try:
-                docs = retriever.invoke(current_query)
+                docs = retriever.invoke(current_query, config=cfg)
             except Exception as e:
                 yield {"event": "error", "message": f"Retrieval failed: {e}"}
                 return
 
             relevant_docs = _grade_documents(
-                grader_llm, question, docs, domain_description=grader_description,
+                grader_llm, question, docs,
+                domain_description=grader_description, config=cfg,
             )
             ratio = len(relevant_docs) / max(len(docs), 1)
             step = {
@@ -572,7 +592,7 @@ def _build_self_rag_streaming(retriever: BaseRetriever, settings: Settings):
                 break
 
             if attempt < max_retries:
-                current_query = _reformulate_query(grader_llm, current_query)
+                current_query = _reformulate_query(grader_llm, current_query, config=cfg)
                 step = {
                     "step": "reformulate",
                     "original": question,
@@ -588,7 +608,7 @@ def _build_self_rag_streaming(retriever: BaseRetriever, settings: Settings):
 
         answer = ""
         try:
-            for full, piece in _stream_llm_response(llm, messages):
+            for full, piece in _stream_llm_response(llm, messages, config=cfg):
                 answer = full
                 yield {"event": "token", "content": piece}
         except Exception as e:
@@ -598,7 +618,7 @@ def _build_self_rag_streaming(retriever: BaseRetriever, settings: Settings):
         reflection_log.append({"step": "generate", "context_docs": len(relevant_docs)})
 
         # Hallucination check (post-stream, synchronous)
-        grading = _check_hallucination(grader_llm, question, context, answer)
+        grading = _check_hallucination(grader_llm, question, context, answer, config=cfg)
         hallu_step = {"step": "hallucination_check", **grading}
         reflection_log.append(hallu_step)
         yield {"event": "reflection", "step": hallu_step}
@@ -612,14 +632,16 @@ def _build_self_rag_streaming(retriever: BaseRetriever, settings: Settings):
             messages = stricter_prompt.invoke({"context": context, "question": question})
             answer = ""
             try:
-                for full, piece in _stream_llm_response(llm, messages):
+                for full, piece in _stream_llm_response(llm, messages, config=cfg):
                     answer = full
                     yield {"event": "token", "content": piece, "regenerated": True}
             except Exception as e:
                 yield {"event": "error", "message": f"Regeneration failed: {e}"}
                 return
 
-            grading = _check_hallucination(grader_llm, question, context, answer)
+            grading = _check_hallucination(
+                grader_llm, question, context, answer, config=cfg,
+            )
             recheck_step = {"step": "hallucination_recheck", **grading}
             reflection_log.append(recheck_step)
             yield {"event": "reflection", "step": recheck_step}

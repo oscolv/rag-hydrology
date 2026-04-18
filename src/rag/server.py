@@ -134,6 +134,15 @@ class CollectionCreate(BaseModel):
     description: str = ""
 
 
+class FeedbackRequest(BaseModel):
+    rating: int  # +1 or -1
+    request_id: str | None = None
+    comment: str | None = None
+    question: str | None = None
+    answer: str | None = None
+    collection: str | None = None
+
+
 def _settings_for_collection(
     project_root: str, collection: str | None,
 ) -> Settings:
@@ -338,10 +347,31 @@ def create_app(project_root: str = ".") -> FastAPI:
         cache.invalidate(collection)
         return {"invalidated": collection or "all"}
 
+    # ---------- Feedback ----------
+
+    @app.post("/api/feedback")
+    def feedback(body: FeedbackRequest):
+        if body.rating not in (-1, 1):
+            raise HTTPException(400, "rating must be -1 or +1")
+        try:
+            metrics.record_feedback(
+                rating=body.rating,
+                request_id=body.request_id,
+                comment=body.comment,
+                collection=body.collection or get_settings(root).active_collection,
+                question=body.question,
+                answer=body.answer,
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        return {"ok": True}
+
     # ---------- Health ----------
 
     @app.get("/api/health")
     def health():
+        from rag.tracing import host as tracing_host
+        from rag.tracing import is_enabled as tracing_enabled
         settings = get_settings(root)
         base_url = settings.llm_base_url or ""
         if "openrouter" in base_url:
@@ -350,6 +380,7 @@ def create_app(project_root: str = ".") -> FastAPI:
             provider = base_url.replace("https://", "").replace("http://", "").split("/")[0]
         else:
             provider = "openai"
+        tracing_on = tracing_enabled()
         return {
             "ok": True,
             "active_collection": settings.active_collection,
@@ -357,6 +388,10 @@ def create_app(project_root: str = ".") -> FastAPI:
             "embedding_model": settings.llm.embedding_model,
             "provider": provider,
             "base_url": base_url or None,
+            "tracing": {
+                "enabled": tracing_on,
+                "host": tracing_host() if tracing_on else None,
+            },
         }
 
     # ---------- Static web UI ----------
