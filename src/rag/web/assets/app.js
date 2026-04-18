@@ -13,8 +13,10 @@ function ragApp() {
     streaming: false,
     stats: {},
     examples: [
-      "What are the main findings of these documents?",
-      "Summarize the key methodology used.",
+      "¿Cuáles son los hallazgos principales de estos documentos?",
+      "Resume la metodología clave utilizada.",
+      "¿Qué limitaciones reportan los autores?",
+      "Lista las fuentes de datos y su resolución espacial/temporal.",
     ],
     toast: "",
 
@@ -154,6 +156,7 @@ function ragApp() {
       } finally {
         clearInterval(timer);
         msg.streaming = false;
+        this.streaming = false;
       }
     },
 
@@ -217,16 +220,23 @@ function ragApp() {
       }
     },
 
-    renderAnswer(text, documents) {
+    renderAnswer(text, documents, msgIdx) {
       if (!text) return "";
+      const mi = typeof msgIdx === "number" ? msgIdx : this.messages.length - 1;
       // Turn [N] into clickable anchors to the corresponding source card.
       const withLinks = text.replace(/\[(\d{1,3})\]/g, (m, n) => {
         const idx = parseInt(n, 10);
         if (!documents || idx < 1 || idx > documents.length) return m;
-        return `<a href="#source-${this.messages.length - 1}-${idx}" class="citation" data-n="${idx}">[${idx}]</a>`;
+        return `<a href="#source-${mi}-${idx}" class="citation" data-n="${idx}">[${String(idx).padStart(2, "0")}]</a>`;
       });
       const html = marked.parse(withLinks, { breaks: true });
       return DOMPurify.sanitize(html, { ADD_ATTR: ["data-n"] });
+    },
+
+    autogrow(ev) {
+      const el = ev.target;
+      el.style.height = "auto";
+      el.style.height = Math.min(el.scrollHeight, 180) + "px";
     },
 
     stripHeader(content) {
