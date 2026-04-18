@@ -130,7 +130,7 @@ def _require_ready(settings: Settings, need_index: bool = True) -> bool:
 
 app = typer.Typer(
     name="rag",
-    help="RAG Hydrology — Consulta papers de investigacion con IA",
+    help="RAG — Consulta documentos PDF con IA (dominio configurable en config.yaml)",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -391,10 +391,10 @@ def chat(
     # Welcome
     console.print(LOGO)
     welcome_text = (
-        "[bold]Sesion interactiva[/bold]\n\n"
-        "Pregunta lo que necesites sobre tus documentos de investigacion.\n"
-        "El sistema busca en todos los papers indexados y genera una\n"
-        "respuesta con citas a las fuentes originales.\n"
+        f"[bold]Sesion interactiva — {settings.domain.name}[/bold]\n\n"
+        "Pregunta lo que necesites sobre tus documentos indexados.\n"
+        "El sistema busca en todo el corpus y genera una respuesta\n"
+        "con citas a las fuentes originales.\n"
     )
     console.print(Panel(welcome_text, border_style="blue", padding=(1, 2)))
 
@@ -421,10 +421,11 @@ def chat(
     if features:
         console.print(f"[bold]Tecnicas activas:[/bold] {' + '.join(features)}\n")
 
-    console.print("[bold]Ejemplos de preguntas:[/bold]")
-    console.print('  [dim]"What is GRACE and how does it measure water storage?"[/dim]')
-    console.print('  [dim]"Que informacion contiene el atlas del agua?"[/dim]')
-    console.print('  [dim]"Compare TWS estimation methods from different studies"[/dim]\n')
+    if settings.domain.example_queries:
+        console.print("[bold]Ejemplos de preguntas:[/bold]")
+        for q in settings.domain.example_queries:
+            console.print(f'  [dim]"{q}"[/dim]')
+        console.print()
 
     console.print("[bold]Tips:[/bold]")
     console.print("  - Escribe [cyan]/[/cyan] + [cyan]Tab[/cyan] para ver los comandos disponibles")
@@ -810,7 +811,7 @@ def info(
         vectorstore = Chroma(
             persist_directory=str(chroma_path),
             embedding_function=embeddings,
-            collection_name="hydrology_docs",
+            collection_name=settings.domain.collection_name,
         )
         count = vectorstore._collection.count()
         results = vectorstore.get(include=["metadatas"])
@@ -913,7 +914,7 @@ def docs_list(
         vectorstore = Chroma(
             persist_directory=str(settings.chroma_path),
             embedding_function=embeddings,
-            collection_name="hydrology_docs",
+            collection_name=settings.domain.collection_name,
         )
         results = vectorstore.get(include=["metadatas"])
         for meta in results["metadatas"]:
@@ -1037,7 +1038,7 @@ def docs_remove(
             vectorstore = Chroma(
                 persist_directory=str(settings.chroma_path),
                 embedding_function=embeddings,
-                collection_name="hydrology_docs",
+                collection_name=settings.domain.collection_name,
             )
             results = vectorstore.get(where={"source": name}, include=[])
             if results["ids"]:
@@ -1457,7 +1458,7 @@ def _chat_quick_info(settings: Settings) -> None:
     vectorstore = Chroma(
         persist_directory=str(settings.chroma_path),
         embedding_function=embeddings,
-        collection_name="hydrology_docs",
+        collection_name=settings.domain.collection_name,
     )
     count = vectorstore._collection.count()
     results = vectorstore.get(include=["metadatas"])

@@ -21,24 +21,23 @@ from rag.config import Settings
 
 console = Console()
 
-SYSTEM_PROMPT = """You are a research assistant specializing in water resources, \
-GRACE satellite data, and hydrology. Answer questions using ONLY the provided context.
-
-Rules:
-- Cite sources using [Source: filename, Page: N] format after each claim
-- If the context doesn't contain the answer, say so explicitly
-- For Spanish-language sources, translate relevant content when answering in English
-- Preserve technical accuracy, especially for equations, units, and measurements
-- When discussing GRACE data, be precise about spatial/temporal resolution
-- Structure longer answers with clear paragraphs
-
-Context:
-{context}"""
+# System prompt is resolved from settings.domain.system_prompt at runtime
+# (see _system_prompt below). The template must contain "{context}".
 
 
 # ---------------------------------------------------------------------------
 # LLM Builder
 # ---------------------------------------------------------------------------
+
+
+def _system_prompt(settings: Settings) -> str:
+    """Return the configured system prompt, validating {context} placeholder."""
+    tpl = settings.domain.system_prompt
+    if "{context}" not in tpl:
+        raise ValueError(
+            "domain.system_prompt must contain the '{context}' placeholder"
+        )
+    return tpl
 
 
 def _build_llm(settings: Settings) -> ChatOpenAI:
@@ -72,7 +71,7 @@ def format_documents(docs: list[Document]) -> str:
 # Self-RAG: Document Grading
 # ---------------------------------------------------------------------------
 
-_GRADE_PROMPT = """You are a relevance grader for a hydrology research RAG system.
+_GRADE_PROMPT = """You are a relevance grader for {domain_description}.
 
 Given a user question and retrieved documents, determine which documents contain \
 information relevant to answering the question.
@@ -116,6 +115,7 @@ def _grade_documents(
     llm: ChatOpenAI,
     question: str,
     docs: list[Document],
+    domain_description: str = "a research RAG system",
 ) -> list[Document]:
     """Grade each document's relevance to the question. Return only relevant docs."""
     if not docs:
@@ -135,6 +135,7 @@ def _grade_documents(
         result = chain.invoke({
             "question": question,
             "documents": "\n\n".join(doc_texts),
+            "domain_description": domain_description,
         })
         # Parse JSON array
         grades = json.loads(result.strip())
@@ -191,7 +192,7 @@ def build_rag_chain(retriever: BaseRetriever, settings: Settings):
     llm = _build_llm(settings)
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
+        ("system", _system_prompt(settings)),
         ("human", "{question}"),
     ])
 
@@ -215,7 +216,7 @@ def build_rag_chain_with_sources(retriever: BaseRetriever, settings: Settings):
     llm = _build_llm(settings)
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
+        ("system", _system_prompt(settings)),
         ("human", "{question}"),
     ])
 
@@ -264,14 +265,16 @@ def _build_self_rag_chain(
     # Use a fast/cheap model for grading if available, else same model
     grader_llm = _build_llm(settings)
     max_retries = settings.retrieval.self_rag_max_retries
+    system_prompt_text = _system_prompt(settings)
+    grader_description = settings.domain.grader_description
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
+        ("system", system_prompt_text),
         ("human", "{question}"),
     ])
 
     stricter_prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT + "\n\nIMPORTANT: A previous answer was found to "
+        ("system", system_prompt_text + "\n\nIMPORTANT: A previous answer was found to "
          "contain unsupported claims. Be extra careful to ONLY state facts that are "
          "explicitly present in the context. If unsure, say you don't have enough "
          "information."),
@@ -286,7 +289,9 @@ def _build_self_rag_chain(
         # --- Phase 1: Retrieve & Grade (with retry) ---
         for attempt in range(max_retries + 1):
             docs = retriever.invoke(current_query)
-            relevant_docs = _grade_documents(grader_llm, question, docs)
+            relevant_docs = _grade_documents(
+                grader_llm, question, docs, domain_description=grader_description,
+            )
 
             relevance_ratio = len(relevant_docs) / max(len(docs), 1)
             reflection_log.append({

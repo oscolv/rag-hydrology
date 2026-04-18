@@ -38,6 +38,31 @@ class EvalConfig(BaseModel):
     eval_model: str = "gpt-4o-mini"  # Must be OpenAI model (RAGAS requires strict JSON parsing)
 
 
+class DomainConfig(BaseModel):
+    """Domain customization — makes the RAG usable for any PDF corpus."""
+
+    name: str = "documents"  # Short label shown in CLI greetings
+    collection_name: str = "rag_docs"  # ChromaDB collection name
+    system_prompt: str = (
+        "You are a research assistant. Answer questions using ONLY the provided "
+        "context.\n\n"
+        "Rules:\n"
+        "- Cite sources using [Source: filename, Page: N] format after each claim\n"
+        "- If the context doesn't contain the answer, say so explicitly\n"
+        "- For Spanish-language sources, translate relevant content when answering "
+        "in English\n"
+        "- Preserve technical accuracy, especially for equations, units, and "
+        "measurements\n"
+        "- Structure longer answers with clear paragraphs\n\n"
+        "Context:\n{context}"
+    )
+    grader_description: str = "a research RAG system"  # Filled into the Self-RAG grader prompt
+    example_queries: list[str] = [
+        "What are the main findings of these documents?",
+        "Summarize the key methodology used.",
+    ]
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -70,6 +95,7 @@ class Settings(BaseSettings):
     retrieval: RetrievalConfig = RetrievalConfig()
     llm: LLMConfig = LLMConfig()
     evaluation: EvalConfig = EvalConfig()
+    domain: DomainConfig = DomainConfig()
 
     @property
     def docs_path(self) -> Path:
@@ -100,7 +126,7 @@ def get_settings(project_root: str = ".") -> Settings:
 
     # Build nested config objects from YAML
     kwargs: dict = {"project_root": root}
-    for key in ("chunking", "retrieval", "llm", "evaluation"):
+    for key in ("chunking", "retrieval", "llm", "evaluation", "domain"):
         if key in yaml_data:
             kwargs[key] = yaml_data[key]
 

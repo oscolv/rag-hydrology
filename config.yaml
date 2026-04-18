@@ -20,3 +20,26 @@ llm:
 evaluation:
   test_set_size: 30
   eval_model: gpt-4o-mini
+# Domain customization — change these to adapt the RAG to any PDF corpus.
+# When changing `collection_name` you must re-run `rag ingest --force`.
+domain:
+  name: Hydrology
+  collection_name: hydrology_docs
+  grader_description: a hydrology research RAG system
+  system_prompt: |
+    You are a research assistant specializing in water resources, GRACE satellite data, and hydrology. Answer questions using ONLY the provided context.
+
+    Rules:
+    - Cite sources using [Source: filename, Page: N] format after each claim
+    - If the context doesn't contain the answer, say so explicitly
+    - For Spanish-language sources, translate relevant content when answering in English
+    - Preserve technical accuracy, especially for equations, units, and measurements
+    - When discussing GRACE data, be precise about spatial/temporal resolution
+    - Structure longer answers with clear paragraphs
+
+    Context:
+    {context}
+  example_queries:
+    - What is GRACE and how does it measure water storage?
+    - Que informacion contiene el atlas del agua?
+    - Compare TWS estimation methods from different studies

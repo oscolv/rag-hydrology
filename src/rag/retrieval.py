@@ -111,7 +111,7 @@ def build_retriever(settings: Settings) -> ContextualCompressionRetriever:
     vectorstore = Chroma(
         persist_directory=str(settings.chroma_path),
         embedding_function=embeddings,
-        collection_name="hydrology_docs",
+        collection_name=settings.domain.collection_name,
     )
 
     # Load BM25 index
