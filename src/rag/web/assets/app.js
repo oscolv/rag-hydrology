@@ -1,5 +1,11 @@
 /* global Alpine, marked, DOMPurify */
 
+// pdf.js document objects use private class fields (#d). Alpine wraps reactive
+// state in a Proxy, and accessing private fields through a Proxy throws
+// "Cannot read private member #d". We keep the pdf.js doc in a module-scoped
+// holder so Alpine never sees it.
+const _pdfState = { doc: null };
+
 function ragApp() {
   return {
     tab: "chat",
@@ -21,8 +27,33 @@ function ragApp() {
     ],
     toast: "",
 
+    // PDF viewer state (pdfDoc lives in module-scoped _pdfState; see top of file)
+    pdfOpen: false,
+    pdfFile: "",
+    pdfPage: 1,
+    pdfTotalPages: 0,
+    pdfHighlight: "",
+    pdfLoading: false,
+    pdfError: "",
+    pdfZoom: 1,  // user zoom multiplier on top of fit-width; 1x/1.5x/2x...
+    _pdfRenderToken: 0,
+
     async init() {
       await Promise.all([this.loadCollections(), this.loadHealth()]);
+      // Delegate citation clicks → open PDF viewer. The anchor's href still
+      // exists as a graceful fallback if JS breaks later.
+      document.addEventListener("click", (e) => {
+        const a = e.target.closest("a.citation");
+        if (!a) return;
+        const mi = parseInt(a.dataset.msg || "-1", 10);
+        const n = parseInt(a.dataset.n || "0", 10);
+        const msg = this.messages[mi];
+        if (!msg || !msg.documents) return;
+        const doc = msg.documents[n - 1];
+        if (!doc || !doc.source) return;
+        e.preventDefault();
+        this.openPdf(doc.source, doc.page, doc.content);
+      });
     },
 
     async loadHealth() {
@@ -238,14 +269,15 @@ function ragApp() {
     renderAnswer(text, documents, msgIdx) {
       if (!text) return "";
       const mi = typeof msgIdx === "number" ? msgIdx : this.messages.length - 1;
-      // Turn [N] into clickable anchors to the corresponding source card.
+      // Turn [N] into clickable anchors. Delegated listener in init() opens
+      // the PDF viewer; href is a fallback scroll target to the source card.
       const withLinks = text.replace(/\[(\d{1,3})\]/g, (m, n) => {
         const idx = parseInt(n, 10);
         if (!documents || idx < 1 || idx > documents.length) return m;
-        return `<a href="#source-${mi}-${idx}" class="citation" data-n="${idx}">[${String(idx).padStart(2, "0")}]</a>`;
+        return `<a href="#source-${mi}-${idx}" class="citation" data-msg="${mi}" data-n="${idx}">[${String(idx).padStart(2, "0")}]</a>`;
       });
       const html = marked.parse(withLinks, { breaks: true });
-      return DOMPurify.sanitize(html, { ADD_ATTR: ["data-n"] });
+      return DOMPurify.sanitize(html, { ADD_ATTR: ["data-n", "data-msg"] });
     },
 
     autogrow(ev) {
@@ -339,6 +371,160 @@ function ragApp() {
     showToast(text) {
       this.toast = text;
       setTimeout(() => { this.toast = ""; }, 2800);
+    },
+
+    // ---- PDF viewer ------------------------------------------------------
+
+    async openPdf(source, page, snippet) {
+      if (!source) return;
+      if (!window.pdfjsLib) {
+        this.showToast("pdf.js no se cargo (revisa tu conexion/CDN)");
+        return;
+      }
+      // The chunk body may start with an ingestion header ("[From: ...]"),
+      // strip it so the highlight matches the actual PDF text.
+      this.pdfHighlight = this.stripHeader(snippet || "");
+      this.pdfFile = source;
+      this.pdfPage = Math.max(1, parseInt(page, 10) || 1);
+      this.pdfLoading = true;
+      this.pdfError = "";
+      this.pdfTotalPages = 0;
+      this.pdfZoom = 1;
+      _pdfState.doc = null;
+      this.pdfOpen = true;
+
+      try {
+        const url = "/api/pdf/" + encodeURIComponent(source);
+        const loadingTask = window.pdfjsLib.getDocument(url);
+        _pdfState.doc = await loadingTask.promise;
+        this.pdfTotalPages = _pdfState.doc.numPages;
+        if (this.pdfPage > this.pdfTotalPages) this.pdfPage = this.pdfTotalPages;
+        await this.pdfRenderPage(this.pdfPage);
+      } catch (e) {
+        this.pdfError = "No se pudo cargar el PDF";
+        // eslint-disable-next-line no-console
+        console.warn("pdf load failed", e);
+      } finally {
+        this.pdfLoading = false;
+      }
+    },
+
+    closePdf() {
+      this.pdfOpen = false;
+      _pdfState.doc = null;
+      this.pdfHighlight = "";
+      this.pdfError = "";
+      // Clear canvas + text layer so reopen doesn't flash the previous page.
+      const canvas = this.$refs.pdfCanvas;
+      const tl = this.$refs.pdfTextLayer;
+      if (canvas) {
+        const ctx = canvas.getContext("2d");
+        ctx && ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      if (tl) tl.innerHTML = "";
+    },
+
+    async pdfGoto(page) {
+      if (!_pdfState.doc) return;
+      if (page < 1 || page > this.pdfTotalPages) return;
+      this.pdfPage = page;
+      await this.pdfRenderPage(page);
+    },
+
+    async pdfZoomBy(factor) {
+      // Clamp so the user can't tank the render with 0.1x or blow up memory at 8x.
+      const next = Math.max(0.5, Math.min(3, this.pdfZoom * factor));
+      if (Math.abs(next - this.pdfZoom) < 0.01) return;
+      this.pdfZoom = next;
+      await this.pdfRenderPage(this.pdfPage);
+    },
+
+    async pdfRenderPage(pageNum) {
+      if (!_pdfState.doc) return;
+      // Serialize renders — fast clicks on prev/next can otherwise race.
+      const token = ++this._pdfRenderToken;
+      this.pdfLoading = true;
+      try {
+        const page = await _pdfState.doc.getPage(pageNum);
+        if (token !== this._pdfRenderToken) return;
+
+        const canvas = this.$refs.pdfCanvas;
+        const textLayerDiv = this.$refs.pdfTextLayer;
+        const wrap = this.$refs.pdfWrap;
+        if (!canvas || !textLayerDiv || !wrap) return;
+
+        // Fit-width uses the scrollable body container (wrap itself is
+        // max-content and would feed back its own width). Fall back to a
+        // sensible default if the body isn't laid out yet.
+        const body = wrap.parentElement;
+        const availableWidth = Math.max(320, (body?.clientWidth || 900) - 32);
+        const baseViewport = page.getViewport({ scale: 1 });
+        const fitScale = availableWidth / baseViewport.width;
+        const scale = Math.min(4, fitScale * this.pdfZoom);
+        const viewport = page.getViewport({ scale });
+
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = Math.floor(viewport.width * dpr);
+        canvas.height = Math.floor(viewport.height * dpr);
+        canvas.style.width = Math.floor(viewport.width) + "px";
+        canvas.style.height = Math.floor(viewport.height) + "px";
+
+        const ctx = canvas.getContext("2d");
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        if (token !== this._pdfRenderToken) return;
+
+        // Text layer — size the container to match the canvas and render
+        // text spans on top so the user can select + we can highlight.
+        textLayerDiv.innerHTML = "";
+        textLayerDiv.style.width = Math.floor(viewport.width) + "px";
+        textLayerDiv.style.height = Math.floor(viewport.height) + "px";
+        const textContent = await page.getTextContent();
+        if (token !== this._pdfRenderToken) return;
+        this._renderTextLayer(textLayerDiv, textContent, viewport);
+        this._applyHighlight(textLayerDiv, this.pdfHighlight);
+      } catch (e) {
+        this.pdfError = "Error al renderizar: " + (e?.message || e);
+        // eslint-disable-next-line no-console
+        console.warn("pdf render failed", e);
+      } finally {
+        if (token === this._pdfRenderToken) this.pdfLoading = false;
+      }
+    },
+
+    _renderTextLayer(container, textContent, viewport) {
+      // Manual text-layer render: absolute-positioned <span>s whose font-size
+      // matches the item's transform. Enough for selection + class-based
+      // highlighting; we don't need the full pdf.js TextLayer widget.
+      const Util = window.pdfjsLib.Util;
+      for (const item of textContent.items) {
+        if (!item.str) continue;
+        const tx = Util.transform(viewport.transform, item.transform);
+        const fontHeight = Math.hypot(tx[2], tx[3]);
+        const span = document.createElement("span");
+        span.textContent = item.str;
+        span.style.left = tx[4] + "px";
+        span.style.top = (tx[5] - fontHeight) + "px";
+        span.style.fontSize = fontHeight + "px";
+        span.style.fontFamily = "sans-serif";
+        container.appendChild(span);
+      }
+    },
+
+    _applyHighlight(container, snippet) {
+      if (!snippet) return;
+      const norm = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
+      // Cap the snippet — we only need a few overlapping anchors for the eye
+      // to find the passage. Full 2kb chunk is noisy and slow.
+      const target = norm(snippet).slice(0, 400);
+      if (target.length < 6) return;
+      for (const span of container.querySelectorAll("span")) {
+        const txt = norm(span.textContent);
+        if (txt.length < 4) continue;
+        if (target.includes(txt)) {
+          span.classList.add("hl");
+        }
+      }
     },
   };
 }

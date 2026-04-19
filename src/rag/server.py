@@ -394,6 +394,34 @@ def create_app(project_root: str = ".") -> FastAPI:
             },
         }
 
+    # ---------- PDF source files ----------
+
+    @app.get("/api/pdf/{filename}")
+    def serve_pdf(filename: str):
+        # Reject non-PDF extensions early (mime-type lock-in for the UI).
+        if not filename.lower().endswith(".pdf"):
+            raise HTTPException(400, "Only .pdf files are served")
+        # Defensive: a bare filename — no separators, null bytes, or parent refs.
+        # Per-collection docs/ legitimately contains symlinks to shared PDFs, so
+        # we don't .resolve() the candidate (it would follow symlinks out of the
+        # dir). Blocking separators/`..` at the filename level is sufficient.
+        if (
+            "/" in filename
+            or "\\" in filename
+            or "\x00" in filename
+            or ".." in filename
+        ):
+            raise HTTPException(400, "Invalid filename")
+        settings = get_settings(root)
+        candidate = settings.docs_path / filename
+        if not candidate.is_file():
+            raise HTTPException(404, "PDF not found")
+        return FileResponse(
+            candidate,
+            media_type="application/pdf",
+            filename=candidate.name,
+        )
+
     # ---------- Static web UI ----------
 
     if WEB_DIR.exists():

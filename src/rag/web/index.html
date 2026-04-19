@@ -8,6 +8,13 @@
     <script src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js" defer></script>
     <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.2/dist/purify.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+      if (window['pdfjsLib']) {
+        window['pdfjsLib'].GlobalWorkerOptions.workerSrc =
+          'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      }
+    </script>
   </head>
   <body>
     <div id="app" x-data="ragApp()" x-init="init()" x-cloak>
@@ -271,6 +278,14 @@
                                     <span class="expand">▸</span>
                                   </summary>
                                   <div class="src-body" x-text="stripHeader(doc.content)"></div>
+                                  <div class="src-actions">
+                                    <button
+                                      type="button"
+                                      class="src-open"
+                                      @click.prevent="openPdf(doc.source, doc.page, doc.content)"
+                                      title="Abrir PDF en el visor"
+                                    >▤ Ver PDF</button>
+                                  </div>
                                 </details>
                               </template>
                             </div>
@@ -493,6 +508,83 @@
               <button type="submit" class="btn-accent">Crear corpus</button>
             </div>
           </form>
+        </div>
+      </div>
+
+      <!-- ===================== PDF VIEWER MODAL ===================== -->
+      <div
+        x-show="pdfOpen"
+        x-transition.opacity.duration.150ms
+        class="overlay pdf-overlay"
+        @click.self="closePdf()"
+        @keydown.escape.window="pdfOpen && closePdf()"
+      >
+        <div class="modal pdf-modal">
+          <div class="modal-head pdf-head">
+            <div class="pdf-head-info">
+              <div class="tag">PDF VIEWER</div>
+              <h3 x-text="pdfFile || '—'"></h3>
+              <p>
+                <span x-text="'Página ' + pdfPage + ' / ' + (pdfTotalPages || '?')"></span>
+                <template x-if="pdfLoading">
+                  <span class="pdf-loading"> · cargando…</span>
+                </template>
+                <template x-if="pdfError">
+                  <span class="pdf-error" x-text="' · ' + pdfError"></span>
+                </template>
+              </p>
+            </div>
+            <button
+              type="button"
+              class="pdf-close"
+              @click="closePdf()"
+              title="Cerrar (ESC)"
+              aria-label="Cerrar"
+            >×</button>
+          </div>
+          <div class="pdf-body">
+            <div class="pdf-canvas-wrap" x-ref="pdfWrap">
+              <canvas x-ref="pdfCanvas"></canvas>
+              <div class="textLayer" x-ref="pdfTextLayer"></div>
+            </div>
+          </div>
+          <div class="pdf-footer">
+            <button
+              type="button"
+              class="btn-ghost"
+              :disabled="pdfPage <= 1 || pdfLoading"
+              @click="pdfGoto(pdfPage - 1)"
+            >‹ anterior</button>
+            <span class="pdf-pageinfo">
+              <span x-text="pdfPage"></span>
+              <span class="sep">/</span>
+              <span x-text="pdfTotalPages || '?'"></span>
+            </span>
+            <button
+              type="button"
+              class="btn-ghost"
+              :disabled="!pdfTotalPages || pdfPage >= pdfTotalPages || pdfLoading"
+              @click="pdfGoto(pdfPage + 1)"
+            >siguiente ›</button>
+
+            <span class="pdf-footer-sep">│</span>
+
+            <button
+              type="button"
+              class="btn-ghost"
+              :disabled="pdfLoading || pdfZoom <= 0.5"
+              @click="pdfZoomBy(1 / 1.25)"
+              title="Reducir"
+            >−</button>
+            <span class="pdf-pageinfo" x-text="Math.round(pdfZoom * 100) + '%'"></span>
+            <button
+              type="button"
+              class="btn-ghost"
+              :disabled="pdfLoading || pdfZoom >= 3"
+              @click="pdfZoomBy(1.25)"
+              title="Aumentar"
+            >+</button>
+          </div>
         </div>
       </div>
 

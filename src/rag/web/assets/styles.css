@@ -1361,6 +1361,156 @@ main > section[style*="display: none"] { display: none !important; }
 }
 
 /* ============================================================================
+ * PDF VIEWER
+ * ========================================================================= */
+
+.pdf-overlay {
+  padding: 0;
+}
+.pdf-modal {
+  max-width: min(1100px, 96vw);
+  width: 96vw;
+  height: 94vh;
+  max-height: 94vh;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  overflow: hidden;
+}
+.pdf-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  padding: 14px 22px 10px;
+  border-bottom: 1px solid var(--line);
+  gap: 16px;
+}
+.pdf-head-info { min-width: 0; }
+.pdf-head-info h3 {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 400;
+  margin: 6px 0 4px;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 70vw;
+}
+.pdf-head-info p {
+  color: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  margin: 0;
+  letter-spacing: 0.04em;
+}
+.pdf-loading { color: var(--warn); }
+.pdf-error   { color: var(--danger); }
+.pdf-close {
+  background: transparent;
+  border: 1px solid var(--line-hard);
+  color: var(--ink-dim);
+  font-size: 20px;
+  line-height: 1;
+  width: 32px;
+  height: 32px;
+  cursor: pointer;
+  font-family: var(--mono);
+  transition: color .12s, border-color .12s, background .12s;
+}
+.pdf-close:hover {
+  color: var(--ink);
+  border-color: var(--accent);
+  background: var(--panel-hi);
+}
+.pdf-body {
+  overflow: auto;
+  background: #1a1a1d;
+  padding: 16px;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+}
+.pdf-canvas-wrap {
+  position: relative;
+  width: max-content;
+  box-shadow: 0 10px 30px rgba(0,0,0,.6);
+  background: #fff;  /* canvas renders on white PDF bg */
+}
+.pdf-canvas-wrap canvas {
+  display: block;
+}
+.pdf-canvas-wrap .textLayer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: hidden;
+  opacity: 1;
+  line-height: 1;
+  user-select: text;
+  pointer-events: auto;
+  color: transparent;
+}
+.pdf-canvas-wrap .textLayer span {
+  position: absolute;
+  white-space: pre;
+  transform-origin: 0 0;
+  color: transparent;
+}
+.pdf-canvas-wrap .textLayer span::selection {
+  background: rgba(212, 255, 58, 0.4);
+}
+.pdf-canvas-wrap .textLayer span.hl {
+  background: rgba(255, 235, 59, 0.45);
+  box-shadow: 0 0 0 1px rgba(255, 235, 59, 0.6);
+  border-radius: 2px;
+}
+.pdf-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 10px 22px;
+  border-top: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-dim);
+}
+.pdf-pageinfo {
+  min-width: 70px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.pdf-pageinfo .sep {
+  color: var(--ink-mute);
+  padding: 0 4px;
+}
+.pdf-footer-sep {
+  color: var(--ink-ghost);
+  padding: 0 6px;
+}
+.src-actions {
+  padding: 4px 12px 10px;
+  display: flex;
+  justify-content: flex-end;
+}
+.src-open {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  background: transparent;
+  border: 1px solid var(--line-hard);
+  color: var(--ink-dim);
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: color .12s, border-color .12s, background .12s;
+}
+.src-open:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ============================================================================
  * UTILITIES
  * ========================================================================= */
 

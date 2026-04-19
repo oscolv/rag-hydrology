@@ -180,3 +180,54 @@ def test_feedback_round_trip_appears_in_stats(client):
     body = r.json()
     assert body["feedback"]["positive"] == 1
     assert body["feedback"]["negative"] == 2
+
+
+# ----------------------------------------------------------------------
+# PDF source serving
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture()
+def pdf_client(tmp_path, monkeypatch):
+    """Client with a real PDF file staged in the active collection's docs dir."""
+    get_settings.cache_clear()
+    monkeypatch.delenv("RAG_COLLECTION", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+
+    app = create_app(str(tmp_path))
+    with TestClient(app) as c:
+        settings = get_settings(str(tmp_path))
+        docs = settings.docs_path
+        docs.mkdir(parents=True, exist_ok=True)
+        # Minimal valid-enough PDF marker: the endpoint doesn't parse, only
+        # streams bytes + checks extension + checks path is inside docs_path.
+        (docs / "sample.pdf").write_bytes(b"%PDF-1.4\n%EOF\n")
+        (tmp_path / "outside.pdf").write_bytes(b"%PDF-SECRET\n")
+        yield c
+
+    get_settings.cache_clear()
+
+
+def test_pdf_endpoint_serves_file(pdf_client):
+    r = pdf_client.get("/api/pdf/sample.pdf")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/pdf"
+    assert r.content.startswith(b"%PDF-1.4")
+
+
+def test_pdf_endpoint_returns_404_when_missing(pdf_client):
+    r = pdf_client.get("/api/pdf/nope.pdf")
+    assert r.status_code == 404
+
+
+def test_pdf_endpoint_rejects_non_pdf_extension(pdf_client):
+    r = pdf_client.get("/api/pdf/evil.html")
+    assert r.status_code == 400
+
+
+def test_pdf_endpoint_rejects_filename_with_separators(pdf_client):
+    # FastAPI single-segment path params already block literal `/`, but the
+    # defensive check in the handler catches any filename that still contains
+    # separators after decoding (e.g. backslash on some stacks).
+    r = pdf_client.get("/api/pdf/foo%5Cbar.pdf")  # %5C = backslash
+    assert r.status_code == 400
