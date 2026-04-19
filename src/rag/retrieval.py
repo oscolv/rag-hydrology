@@ -1,5 +1,6 @@
 """Hybrid retrieval pipeline: dense + BM25 with RRF fusion, multi-query, and reranking."""
 
+import logging
 import pickle  # nosec B403 — loaded file is gated by a magic header, see load_bm25_index
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -17,6 +18,8 @@ from rank_bm25 import BM25Okapi
 
 from rag.config import Settings
 from rag.factories import get_chat_llm, get_embeddings
+
+log = logging.getLogger(__name__)
 
 
 class HybridRetriever(BaseRetriever):
@@ -105,6 +108,68 @@ class HybridRetriever(BaseRetriever):
         return f"{doc.metadata.get('source', '')}:{doc.metadata.get('page', '')}:{hash(doc.page_content[:200])}"
 
 
+class ParentExpansionRetriever(BaseRetriever):
+    """Wraps another retriever and substitutes child docs with their parents.
+
+    Implements the second half of small-to-big retrieval: the inner retriever
+    returns the top-k *children* (small, precisely matched), and we deduplicate
+    by `parent_id` and replace each with its parent doc for richer LLM context.
+
+    Children whose `parent_id` is missing or unknown to the store are passed
+    through unchanged — this lets the wrapper degrade gracefully when the
+    parents file is stale or absent.
+    """
+
+    base: Any = Field(exclude=True)
+
+    _parents: dict[str, Document] = PrivateAttr()
+
+    def __init__(
+        self,
+        base: BaseRetriever,
+        parents: dict[str, Document],
+        **kwargs: Any,
+    ):
+        super().__init__(base=base, **kwargs)
+        self._parents = parents
+
+    def _expand(self, children: list[Document]) -> list[Document]:
+        if not self._parents:
+            return children
+        seen: set[str] = set()
+        out: list[Document] = []
+        missing = 0
+        for child in children:
+            pid = child.metadata.get("parent_id")
+            if pid and pid in self._parents:
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                out.append(self._parents[pid])
+            else:
+                if pid:
+                    missing += 1
+                out.append(child)
+        if missing:
+            log.warning(
+                "parent_expansion: %d/%d children had unknown parent_id",
+                missing, len(children),
+            )
+        return out
+
+    def _get_relevant_documents(
+        self,
+        query: str,
+        *,
+        run_manager: CallbackManagerForRetrieverRun | None = None,
+    ) -> list[Document]:
+        cfg: dict[str, Any] = {}
+        if run_manager is not None:
+            cfg["callbacks"] = run_manager.get_child()
+        children = self.base.invoke(query, config=cfg)
+        return self._expand(children)
+
+
 _BM25_MAGIC = b"RAG-BM25v1\n"
 
 
@@ -130,8 +195,26 @@ def load_bm25_index(bm25_path: Path) -> tuple[BM25Okapi, list[Document]]:
     return data["bm25"], data["documents"]
 
 
-def build_retriever(settings: Settings) -> ContextualCompressionRetriever:
-    """Build the full retrieval pipeline: hybrid search + multi-query + reranking."""
+def _load_parents_if_enabled(settings: Settings) -> dict[str, Document]:
+    """Load the parents store when parent_child mode is on; quiet fallback otherwise."""
+    if not settings.chunking.parent_child:
+        return {}
+    # Local import keeps ingest.py off the import path of bare retriever use.
+    from rag.ingest import load_parents_index
+    try:
+        return load_parents_index(settings.parents_full_path)
+    except (OSError, ValueError) as e:
+        log.warning("parent_child: failed to load parents store: %s", e)
+        return {}
+
+
+def build_retriever(settings: Settings) -> BaseRetriever:
+    """Build the full retrieval pipeline: hybrid search + multi-query + reranking.
+
+    When `chunking.parent_child` is enabled and a parents store is present,
+    wraps the result so the rerank's top-k children get expanded to their
+    deduplicated parent documents before the LLM sees them.
+    """
     embeddings = get_embeddings(settings)
     vectorstore = Chroma(
         persist_directory=str(settings.chroma_path),
@@ -168,7 +251,12 @@ def build_retriever(settings: Settings) -> ContextualCompressionRetriever:
         cohere_api_key=settings.cohere_api_key,
     )
 
-    return ContextualCompressionRetriever(
+    rerank_chain = ContextualCompressionRetriever(
         base_compressor=reranker,
         base_retriever=base_retriever,
     )
+
+    parents = _load_parents_if_enabled(settings)
+    if parents:
+        return ParentExpansionRetriever(base=rerank_chain, parents=parents)
+    return rerank_chain

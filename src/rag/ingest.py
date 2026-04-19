@@ -49,6 +49,91 @@ def _file_hash(path: Path) -> str:
     return h.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# Parent-child (small-to-big) helpers
+# ---------------------------------------------------------------------------
+
+_PARENTS_MAGIC = b"RAG-PARENTSv1\n"
+
+
+def _make_parent_id(doc: Document) -> str:
+    """Deterministic 16-char ID from file_hash + page + content prefix.
+
+    Stable across re-ingests of the same PDF — useful when the parents store
+    needs rebuilding without re-embedding everything.
+    """
+    fingerprint = (
+        f"{doc.metadata.get('file_hash', '')}"
+        f":{doc.metadata.get('page', '')}"
+        f":{doc.page_content[:200]}"
+    )
+    return hashlib.md5(
+        fingerprint.encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:16]
+
+
+def to_children(parents: list[Document], settings: Settings) -> list[Document]:
+    """Sub-split parent chunks into smaller children for precise matching.
+
+    Each child inherits its parent's metadata plus `parent_id` and
+    `is_child=True`. Children are what gets indexed in Chroma + BM25;
+    parents are stored separately and served to the LLM after retrieval.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.chunking.child_chunk_size,
+        chunk_overlap=settings.chunking.child_chunk_overlap,
+        separators=["\n\n", "\n", ". ", " "],
+        length_function=len,
+    )
+    children: list[Document] = []
+    for parent in parents:
+        parent_id = parent.metadata.get("parent_id")
+        if not parent_id:
+            continue
+        for text in splitter.split_text(parent.page_content):
+            if not text.strip():
+                continue
+            children.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        **parent.metadata,
+                        "parent_id": parent_id,
+                        "is_child": True,
+                    },
+                )
+            )
+    return children
+
+
+def save_parents_index(path: Path, parents: list[Document]) -> None:
+    """Serialize the parents store keyed by parent_id with a magic header."""
+    payload = {p.metadata["parent_id"]: p for p in parents if p.metadata.get("parent_id")}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(_PARENTS_MAGIC)
+        pickle.dump(payload, f)
+
+
+def load_parents_index(path: Path) -> dict[str, Document]:
+    """Load the parents store. Returns {} if the file is missing.
+
+    Same magic-header gating as the BM25 index: cheap integrity check, not a
+    security boundary. Re-ingest if you don't trust the file's origin.
+    """
+    if not path.exists():
+        return {}
+    with open(path, "rb") as f:
+        header = f.read(len(_PARENTS_MAGIC))
+        if header != _PARENTS_MAGIC:
+            raise ValueError(
+                f"Parents index at {path} has an unrecognized format. "
+                "Re-run `rag ingest --force` to rebuild it."
+            )
+        return pickle.load(f)  # noqa: S301  # nosec B301 — magic header gates input
+
+
 def _extract_year(filename: str, text: str) -> str:
     """Try to extract publication year from filename or content."""
     match = re.search(r"(19|20)\d{2}", filename)
@@ -600,6 +685,22 @@ def ingest_documents(settings: Settings, force: bool = False) -> dict:
         console.print("[red]No chunks generated.[/red]")
         return {"pdfs": len(unique_files), "chunks": 0, "skipped": skipped}
 
+    # Parent-child split: stamp parents with IDs, generate children, and
+    # swap `all_chunks` so what gets indexed downstream are children.
+    use_parent_child = settings.chunking.parent_child
+    parents: list[Document] = []
+    if use_parent_child:
+        for parent in all_chunks:
+            parent.metadata["parent_id"] = _make_parent_id(parent)
+        parents = all_chunks
+        children = to_children(parents, settings)
+        console.print(
+            f"[bold cyan]Parent-Child[/bold cyan] activado: "
+            f"{len(parents)} padres → {len(children)} hijos "
+            f"(child_size={settings.chunking.child_chunk_size})"
+        )
+        all_chunks = children
+
     # Clear existing index if force
     chroma_path = settings.chroma_path
     if force and chroma_path.exists():
@@ -610,6 +711,10 @@ def ingest_documents(settings: Settings, force: bool = False) -> dict:
     bm25_full_path = settings.bm25_full_path
     if force and bm25_full_path.exists():
         bm25_full_path.unlink()
+
+    parents_full_path = settings.parents_full_path
+    if force and parents_full_path.exists():
+        parents_full_path.unlink()
 
     # Create data directory
     chroma_path.parent.mkdir(parents=True, exist_ok=True)
@@ -648,6 +753,11 @@ def ingest_documents(settings: Settings, force: bool = False) -> dict:
         f.write(_BM25_MAGIC)
         pickle.dump({"bm25": bm25, "documents": all_chunks}, f)
 
+    # Persist the parents store last — its presence tells the retriever to
+    # expand children → parents at query time.
+    if use_parent_child and parents:
+        save_parents_index(parents_full_path, parents)
+
     chunking_mode = "semantic" if use_semantic else "fixed"
     stats = {
         "pdfs": len(unique_files),
@@ -655,7 +765,10 @@ def ingest_documents(settings: Settings, force: bool = False) -> dict:
         "skipped": skipped,
         "chunking": chunking_mode,
         "contextual": use_contextual,
+        "parent_child": use_parent_child,
     }
+    if use_parent_child:
+        stats["parents"] = len(parents)
     console.print(
         f"\n[bold green]Ingestion complete:[/bold green] "
         f"{stats['pdfs']} PDFs → {stats['chunks']} chunks "
@@ -663,6 +776,7 @@ def ingest_documents(settings: Settings, force: bool = False) -> dict:
     )
     console.print(
         f"  Chunking: [cyan]{chunking_mode}[/cyan] | "
-        f"Contextual Retrieval: [cyan]{'ON' if use_contextual else 'OFF'}[/cyan]"
+        f"Contextual Retrieval: [cyan]{'ON' if use_contextual else 'OFF'}[/cyan] | "
+        f"Parent-Child: [cyan]{'ON' if use_parent_child else 'OFF'}[/cyan]"
     )
     return stats

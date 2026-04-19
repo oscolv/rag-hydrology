@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 from langchain_core.documents import Document
 
 from rag.config import ChunkingConfig, Settings
@@ -10,8 +11,12 @@ from rag.ingest import (
     _enforce_chunk_sizes,
     _extract_section_header,
     _extract_year,
+    _make_parent_id,
     _split_sentences,
     build_chunks,
+    load_parents_index,
+    save_parents_index,
+    to_children,
 )
 
 
@@ -105,3 +110,82 @@ def test_build_chunks_metadata():
     assert chunks[0].metadata["language"] == "en"
     assert chunks[0].metadata["file_hash"] == "hash123"
     assert chunks[0].metadata["page"] == 1  # 1-indexed
+
+
+# ----------------------------------------------------------------------
+# Parent-child (small-to-big) helpers
+# ----------------------------------------------------------------------
+
+
+def _make_doc(content: str, **meta) -> Document:
+    base = {"file_hash": "abc", "page": 1, "source": "x.pdf"}
+    base.update(meta)
+    return Document(page_content=content, metadata=base)
+
+
+def test_make_parent_id_deterministic():
+    a = _make_doc("Some content here that is long enough to fingerprint.")
+    b = _make_doc("Some content here that is long enough to fingerprint.")
+    assert _make_parent_id(a) == _make_parent_id(b)
+
+
+def test_make_parent_id_differs_for_different_content():
+    a = _make_doc("Content A")
+    b = _make_doc("Content B")
+    assert _make_parent_id(a) != _make_parent_id(b)
+
+
+def test_make_parent_id_differs_for_different_pages():
+    a = _make_doc("Same body", page=1)
+    b = _make_doc("Same body", page=2)
+    assert _make_parent_id(a) != _make_parent_id(b)
+
+
+def test_to_children_inherits_metadata_and_marks_children():
+    settings = MagicMock(spec=Settings)
+    settings.chunking = ChunkingConfig(child_chunk_size=80, child_chunk_overlap=10)
+
+    long_text = " ".join(["GRACE measures gravity from orbit."] * 30)  # ~1000 chars
+    parent = _make_doc(long_text, page=4, source="paper.pdf")
+    parent.metadata["parent_id"] = _make_parent_id(parent)
+
+    children = to_children([parent], settings)
+
+    assert len(children) > 1
+    for child in children:
+        assert child.metadata["parent_id"] == parent.metadata["parent_id"]
+        assert child.metadata["is_child"] is True
+        assert child.metadata["source"] == "paper.pdf"
+        assert child.metadata["page"] == 4
+
+
+def test_to_children_skips_parents_without_id():
+    settings = MagicMock(spec=Settings)
+    settings.chunking = ChunkingConfig(child_chunk_size=80, child_chunk_overlap=10)
+
+    parent_no_id = _make_doc("body without an id assigned")
+    children = to_children([parent_no_id], settings)
+    assert children == []
+
+
+def test_parents_index_round_trip(tmp_path):
+    parent = _make_doc("Body", page=2)
+    parent.metadata["parent_id"] = _make_parent_id(parent)
+
+    path = tmp_path / "parents.pkl"
+    save_parents_index(path, [parent])
+
+    loaded = load_parents_index(path)
+    assert parent.metadata["parent_id"] in loaded
+    assert loaded[parent.metadata["parent_id"]].page_content == "Body"
+
+
+def test_load_parents_index_returns_empty_when_missing(tmp_path):
+    assert load_parents_index(tmp_path / "absent.pkl") == {}
+
+
+def test_load_parents_index_rejects_unknown_format(tmp_path):
+    bad = tmp_path / "bad.pkl"
+    bad.write_bytes(b"not-the-magic-header")
+    with pytest.raises(ValueError, match="unrecognized format"):
+        load_parents_index(bad)

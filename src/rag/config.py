@@ -22,6 +22,14 @@ class ChunkingConfig(BaseModel):
     context_model: str | None = None  # Model for context generation (None = use llm.model)
     context_workers: int = 8  # Parallel threads for contextual retrieval LLM calls
 
+    # Parent-child (small-to-big) retrieval: index small children for precise
+    # matching, hand parents to the LLM for richer context. When ON, the
+    # ingestion writes a `parents.pkl` next to the BM25 index and Chroma stores
+    # the children. The retriever expands children → deduped parents post-rerank.
+    parent_child: bool = False
+    child_chunk_size: int = 400
+    child_chunk_overlap: int = 50
+
 
 class RetrievalConfig(BaseModel):
     dense_k: int = 20
@@ -174,6 +182,13 @@ class Settings(BaseSettings):
         if self._use_legacy():
             return self._legacy_bm25
         return self._collection_dir(self.active_collection) / "bm25.pkl"
+
+    @property
+    def parents_full_path(self) -> Path:
+        """Where parent-child mode stores the parent documents store."""
+        if self._use_legacy():
+            return self.project_root / self.data_dir / "parents.pkl"
+        return self._collection_dir(self.active_collection) / "parents.pkl"
 
     @property
     def metrics_db_path(self) -> Path:
